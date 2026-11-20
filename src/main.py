@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import time
+from urllib.error import HTTPError
 
 from ai_evaluator import evaluate_candidate
 from config import PAIRS, TBILISI_TZ, is_within_entry_window
@@ -11,6 +12,30 @@ from notifier import send_telegram_message
 from technical_filter import confirm_3h_alignment, detect_5m_candidate, infer_30m_bias
 
 STATE_FILE = Path("state/sent_alerts.json")
+REQUEST_DELAY_SEC = 6.0  # ~3 წუთი მთლიან 30 მოთხოვნაზე (10 წყვილი x 3 TF)
+
+
+def fetch_with_retry(
+    pair: str,
+    interval: str,
+    outputsize: int,
+    max_retries: int = 2,
+    backoff_sec: float = 65.0,
+) -> list[dict]:
+  for attempt in range(max_retries + 1):
+    try:
+      candles = fetch_candles(pair, interval, outputsize=outputsize)
+      time.sleep(REQUEST_DELAY_SEC)
+      return candles
+    except HTTPError as exc:
+      if exc.code == 429 and attempt < max_retries:
+        print(
+            f"[{pair} {interval}] HTTP 429 rate limit hit. Waiting {backoff_sec}s "
+            f"(retry {attempt + 1}/{max_retries})..."
+        )
+        time.sleep(backoff_sec)
+        continue
+      raise
 
 
 def load_state() -> dict:
@@ -66,12 +91,9 @@ def main() -> None:
   for pair in PAIRS:
     print(f"\n--- [{pair}] ---")
     try:
-      candles_5m = fetch_candles(pair, "5min", outputsize=60)
-      time.sleep(1.0)
-      candles_30m = fetch_candles(pair, "30min", outputsize=60)
-      time.sleep(1.0)
-      candles_1h = fetch_candles(pair, "1h", outputsize=45)
-      time.sleep(1.0)
+      candles_5m = fetch_with_retry(pair, "5min", outputsize=60)
+      candles_30m = fetch_with_retry(pair, "30min", outputsize=60)
+      candles_1h = fetch_with_retry(pair, "1h", outputsize=45)
     except Exception as exc:
       print(f"[{pair}] ERROR fetching data: {exc}")
       continue
