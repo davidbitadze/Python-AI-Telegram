@@ -12,7 +12,7 @@ from notifier import send_telegram_message
 from technical_filter import confirm_3h_alignment, detect_5m_candidate, infer_30m_bias
 
 STATE_FILE = Path("state/sent_alerts.json")
-REQUEST_DELAY_SEC = 6.0  # ~3 წუთი მთლიან 30 მოთხოვნაზე (10 წყვილი x 3 TF)
+REQUEST_DELAY_SEC = 6.0
 
 
 def fetch_with_retry(
@@ -91,18 +91,36 @@ def main() -> None:
   for pair in PAIRS:
     print(f"\n--- [{pair}] ---")
     try:
-      candles_5m = fetch_with_retry(pair, "5min", outputsize=60)
-      candles_30m = fetch_with_retry(pair, "30min", outputsize=60)
+      # 1. ჯერ 30M (SMA 150 / mult 1.50-ისთვის)
+      candles_30m = fetch_with_retry(pair, "30min", outputsize=160)
+      bias_30m = infer_30m_bias(candles_30m)
+
+      # 2. შემდეგ 1H -> 3H კონტექსტის დადასტურება
       candles_1h = fetch_with_retry(pair, "1h", outputsize=45)
+      candles_3h = build_3h_from_1h(candles_1h)
+      aligned_3h = confirm_3h_alignment(candles_3h, bias_30m)
+
+      if not aligned_3h:
+        scanned_count += 1
+        print(
+            f"[{pair}] bars=(30m:{len(candles_30m)}, 3h:{len(candles_3h)}) "
+            f"| 30M_bias={bias_30m} | 3H_aligned=False -> SKIP_5M_FETCH"
+        )
+        continue
+
+      # 3. მხოლოდ 30M + 3H დადასტურების შემდეგ ვიღებთ 5M (SMA 200 / mult 1.60-ისთვის)
+      candles_5m = fetch_with_retry(pair, "5min", outputsize=210)
     except Exception as exc:
       print(f"[{pair}] ERROR fetching data: {exc}")
       continue
 
     scanned_count += 1
-    bias_30m = infer_30m_bias(candles_30m)
-    candles_3h = build_3h_from_1h(candles_1h)
-    aligned_3h = confirm_3h_alignment(candles_3h, bias_30m)
-    candidate = detect_5m_candidate(candles_5m, bias_30m, aligned_3h)
+    candidate = detect_5m_candidate(
+        candles_5m=candles_5m,
+        candles_30m=candles_30m,
+        bias_30m=bias_30m,
+        aligned_3h=aligned_3h,
+    )
 
     print(
         f"[{pair}] bars=(5m:{len(candles_5m)}, 30m:{len(candles_30m)}, 3h:{len(candles_3h)}) "
@@ -114,12 +132,14 @@ def main() -> None:
       continue
 
     candidates_count += 1
+    m5 = candidate["matrix_5m"]
     last_dt = candidate["last_candle"]["datetime"]
     alert_key = f"{pair}_{candidate['pattern']}_{candidate['direction']}_{last_dt}"
 
     print(
         f"[{pair}] CANDIDATE found: pattern={candidate['pattern']}, dir={candidate['direction']}, "
-        f"level={candidate['level']}, impulse={candidate.get('impulse_ratio')}, candle_dt={last_dt}"
+        f"level={candidate['level']}, impulse={candidate.get('impulse_ratio')}, "
+        f"5M_vol_above={m5['above_threshold']} (x{m5['ratio']}), candle_dt={last_dt}"
     )
 
     if state.get(alert_key):
@@ -144,9 +164,13 @@ def main() -> None:
     )
 
     if notify_flag:
+      m30 = candidate["matrix_30m"]
       msg = (
           f"<b>{pair}</b> | {candidate['pattern']} ({candidate['direction']})\n"
           f"30M Bias: <b>{bias_30m}</b> | Level: <b>{candidate['level']}</b>\n"
+          f"5M Matrix (200/1.60): <b>{'YES' if m5['above_threshold'] else 'NO'}</b> "
+          f"(x{m5['ratio']}) | 30M (150/1.50): x{m30['ratio']}\n"
+          f"TV Circle / 1M Delta: <i>გადასამოწმებელია TradingView-ზე</i>\n"
           f"Score: <b>{score}/10</b>\n"
           f"დრო: {now_tbilisi.strftime('%H:%M')} (თბილისი)\n"
           f"ანალიზი: {summary}\n"
