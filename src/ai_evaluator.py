@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
@@ -42,7 +43,22 @@ def evaluate_candidate(pair: str, candidate: dict, tbilisi_now_str: str) -> dict
       "შეაფასე სეტაპი წესების მიხედვით და დააბრუნე სტრუქტურირებული პასუხი."
   )
 
-  response = client.models.generate_content(
+  last_exc = None
+  for attempt in range(3):
+    try:
+      response = _generate(client, prompt)
+      return json.loads(response.text)
+    except Exception as exc:  # 503/429 დროებითი გადატვირთვა -> ვცდით თავიდან
+      last_exc = exc
+      if attempt < 2 and any(c in str(exc) for c in ("503", "429", "UNAVAILABLE")):
+        time.sleep(15 * (attempt + 1))
+        continue
+      raise
+  raise last_exc
+
+
+def _generate(client, prompt):
+  return client.models.generate_content(
       model=os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
       contents=prompt,
       config=types.GenerateContentConfig(
@@ -52,4 +68,3 @@ def evaluate_candidate(pair: str, candidate: dict, tbilisi_now_str: str) -> dict
           temperature=0.2,
       ),
   )
-  return json.loads(response.text)
