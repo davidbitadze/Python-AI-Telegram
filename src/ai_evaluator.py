@@ -43,7 +43,7 @@ def evaluate_candidate(pair: str, candidate: dict, tbilisi_now_str: str) -> dict
   )
 
   response = client.models.generate_content(
-      model="gemini-2.5-flash",
+      model=os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
       contents=prompt,
       config=types.GenerateContentConfig(
           system_instruction=SYSTEM_PROMPT,

@@ -167,8 +167,14 @@ def main() -> None:
           tbilisi_now_str=now_tbilisi.strftime("%Y-%m-%d %H:%M"),
       )
     except Exception as exc:
+      # AI-ს შეცდომის გამო სიგნალი არ იკარგება: ვაგზავნით ტექნიკურ კანდიდატს
       print(f"[{pair}] ERROR in AI evaluator: {exc}")
-      continue
+      evaluation = {
+          "notify": True,
+          "quality_score": 0,
+          "setup_summary": f"{candidate['pattern']} ({candidate['direction']}) level {candidate['level']}",
+          "risk_and_caution": "AI შეფასება ვერ შესრულდა; ეს მხოლოდ ტექნიკური ფილტრის კანდიდატია.",
+      }
 
     notify_flag = bool(evaluation.get("notify"))
     score = evaluation.get("quality_score", 0)
