@@ -4,6 +4,18 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch: # ხელით გაშვების ღილაკი ტესტირებისთვის
+    inputs:
+      test_telegram:
+        description: "მხოლოდ სატესტო შეტყობინების გაგზავნა Telegram-ში"
+        type: boolean
+        default: false
+      force_run:
+        description: "სკანირება დროის ფანჯრის/შაბათ-კვირის იგნორით"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # state/sent_alerts.json-ის push-ისთვის
 
 jobs:
   scan:
@@ -28,6 +40,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_TELEGRAM: ${{ inputs.test_telegram }}
+          FORCE_RUN: ${{ inputs.force_run }}
         run: python src/main.py
 
       - name: Save alert state
