@@ -1,4 +1,5 @@
 from datetime import datetime
+import html
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ from notifier import send_telegram_message
 from technical_filter import confirm_3h_alignment, detect_5m_candidate, infer_30m_bias
 
 STATE_FILE = Path("state/sent_alerts.json")
-REQUEST_DELAY_SEC = 6.0
+REQUEST_DELAY_SEC = 8.0  # Twelve Data free: 8 მოთხოვნა/წუთში
 
 
 def fetch_with_retry(
@@ -67,7 +68,20 @@ def build_3h_from_1h(candles_1h: list[dict]) -> list[dict]:
   return blocks
 
 
+def run_telegram_test() -> None:
+  now = datetime.now(TBILISI_TZ).strftime("%Y-%m-%d %H:%M")
+  send_telegram_message(
+      f"✅ სატესტო შეტყობინება\nForex AI Scanner მუშაობს.\nდრო: {now} (თბილისი)",
+      parse_mode=None,
+  )
+  print("Test message sent to Telegram.")
+
+
 def main() -> None:
+  if os.environ.get("TEST_TELEGRAM", "false").lower() == "true":
+    run_telegram_test()
+    return
+
   now_tbilisi = datetime.now(TBILISI_TZ)
   force_run = os.environ.get("FORCE_RUN", "false").lower() == "true"
   in_window = is_within_entry_window(now_tbilisi)
@@ -173,10 +187,14 @@ def main() -> None:
           f"TV Circle / 1M Delta: <i>გადასამოწმებელია TradingView-ზე</i>\n"
           f"Score: <b>{score}/10</b>\n"
           f"დრო: {now_tbilisi.strftime('%H:%M')} (თბილისი)\n"
-          f"ანალიზი: {summary}\n"
-          f"⚠️ რისკი/შენიშვნა: {evaluation.get('risk_and_caution', '')}"
+          f"ანალიზი: {html.escape(summary)}\n"
+          f"⚠️ რისკი/შენიშვნა: {html.escape(evaluation.get('risk_and_caution', ''))}"
       )
-      send_telegram_message(msg)
+      try:
+        send_telegram_message(msg)
+      except Exception as exc:
+        print(f"[{pair}] ERROR sending Telegram: {exc}")
+        continue
       state[alert_key] = now_tbilisi.isoformat()
       state_changed = True
       notified_count += 1
