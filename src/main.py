@@ -14,6 +14,8 @@ from technical_filter import confirm_3h_alignment, detect_5m_candidate, infer_30
 
 STATE_FILE = Path("state/sent_alerts.json")
 REQUEST_DELAY_SEC = 8.0  # Twelve Data free: 8 მოთხოვნა/წუთში
+ALLOWED_PATTERNS = {"DOUBLE_TOP", "DOUBLE_BOTTOM"}
+MAX_AI_EVALS_PER_RUN = 2  # დღიური 20-რექვესთიანი ლიმიტის დასაზოგად
 
 
 def fetch_with_retry(
@@ -77,6 +79,16 @@ def run_telegram_test() -> None:
   print("Test message sent to Telegram.")
 
 
+def candidate_priority(item: dict) -> tuple:
+  """პრიორიტეტს ანიჭებს 5M მოცულობის მქონე და უფრო ძლიერ კანდიდატებს."""
+  cand = item["candidate"]
+  m5 = cand.get("matrix_5m", {})
+  vol_ok = 1 if m5.get("above_threshold") else 0
+  ratio = float(m5.get("ratio") or 0.0)
+  impulse = float(cand.get("impulse_ratio") or 0.0)
+  return (vol_ok, ratio, impulse)
+
+
 def main() -> None:
   if os.environ.get("TEST_TELEGRAM", "false").lower() == "true":
     run_telegram_test()
@@ -101,6 +113,9 @@ def main() -> None:
   scanned_count = 0
   candidates_count = 0
   notified_count = 0
+  ai_evals_used = 0
+  quota_exhausted = False
+  queued_for_ai: list[dict] = []
 
   for pair in PAIRS:
     print(f"\n--- [{pair}] ---")
@@ -145,13 +160,18 @@ def main() -> None:
       print(f"[{pair}] Result: NO_CANDIDATE")
       continue
 
+    pattern_name = candidate.get("pattern", "")
+    if pattern_name not in ALLOWED_PATTERNS:
+      print(f"[{pair}] Result: FILTERED_PATTERN ({pattern_name})")
+      continue
+
     candidates_count += 1
     m5 = candidate["matrix_5m"]
     last_dt = candidate["last_candle"]["datetime"]
-    alert_key = f"{pair}_{candidate['pattern']}_{candidate['direction']}_{last_dt}"
+    alert_key = f"{pair}_{pattern_name}_{candidate['direction']}_{last_dt}"
 
     print(
-        f"[{pair}] CANDIDATE found: pattern={candidate['pattern']}, dir={candidate['direction']}, "
+        f"[{pair}] CANDIDATE found: pattern={pattern_name}, dir={candidate['direction']}, "
         f"level={candidate['level']}, impulse={candidate.get('impulse_ratio')}, "
         f"5M_vol_above={m5['above_threshold']} (x{m5['ratio']}), candle_dt={last_dt}"
     )
@@ -160,6 +180,35 @@ def main() -> None:
       print(f"[{pair}] Result: SKIPPED_DUPLICATE (key={alert_key})")
       continue
 
+    queued_for_ai.append({
+        "pair": pair,
+        "bias_30m": bias_30m,
+        "candidate": candidate,
+        "alert_key": alert_key,
+    })
+
+  # საუკეთესო კანდიდატების შერჩევა AI შეფასებისთვის (კვოტის დასაზოგად)
+  queued_for_ai.sort(key=candidate_priority, reverse=True)
+  selected_for_ai = queued_for_ai[:MAX_AI_EVALS_PER_RUN]
+  skipped_cap = queued_for_ai[MAX_AI_EVALS_PER_RUN:]
+
+  for item in skipped_cap:
+    print(f"[{item['pair']}] Result: SKIPPED_AI_RUN_CAP (max={MAX_AI_EVALS_PER_RUN})")
+
+  for item in selected_for_ai:
+    if quota_exhausted:
+      print(f"[{item['pair']}] Result: SKIPPED_QUOTA_EXHAUSTED")
+      continue
+
+    pair = item["pair"]
+    bias_30m = item["bias_30m"]
+    candidate = item["candidate"]
+    alert_key = item["alert_key"]
+    m5 = candidate["matrix_5m"]
+    m30 = candidate["matrix_30m"]
+    last_dt = candidate["last_candle"]["datetime"]
+
+    ai_evals_used += 1
     try:
       evaluation = evaluate_candidate(
           pair=pair,
@@ -167,14 +216,12 @@ def main() -> None:
           tbilisi_now_str=now_tbilisi.strftime("%Y-%m-%d %H:%M"),
       )
     except Exception as exc:
-      # AI-ს შეცდომის გამო სიგნალი არ იკარგება: ვაგზავნით ტექნიკურ კანდიდატს
-      print(f"[{pair}] ERROR in AI evaluator: {exc}")
-      evaluation = {
-          "notify": True,
-          "quality_score": 0,
-          "setup_summary": f"{candidate['pattern']} ({candidate['direction']}) level {candidate['level']}",
-          "risk_and_caution": "AI შეფასება ვერ შესრულდა; ეს მხოლოდ ტექნიკური ფილტრის კანდიდატია.",
-      }
+      err_str = str(exc)
+      print(f"[{pair}] ERROR in AI evaluator: {err_str}")
+      if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+        quota_exhausted = True
+      # AI შეცდომისას ტყუილად 0/10 სიგნალს ტელეგრამში აღარ ვაგზავნით
+      continue
 
     notify_flag = bool(evaluation.get("notify"))
     score = evaluation.get("quality_score", 0)
@@ -184,7 +231,6 @@ def main() -> None:
     )
 
     if notify_flag:
-      m30 = candidate["matrix_30m"]
       msg = (
           f"<b>{pair}</b> | {candidate['pattern']} ({candidate['direction']})\n"
           f"30M Bias: <b>{bias_30m}</b> | Level: <b>{candidate['level']}</b>\n"
@@ -202,6 +248,7 @@ def main() -> None:
       except Exception as exc:
         print(f"[{pair}] ERROR sending Telegram: {exc}")
         continue
+
       state[alert_key] = now_tbilisi.isoformat()
       state_changed = True
       notified_count += 1
@@ -215,7 +262,8 @@ def main() -> None:
 
   print(
       f"\n=== SCAN SUMMARY | scanned={scanned_count}/{len(PAIRS)} "
-      f"| candidates={candidates_count} | notified={notified_count} ==="
+      f"| candidates={candidates_count} | ai_evals={ai_evals_used} "
+      f"| notified={notified_count} ==="
   )
 
 
