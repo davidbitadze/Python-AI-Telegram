@@ -115,7 +115,7 @@ def confirm_3h_alignment(candles_3h: list[dict], bias_30m: str) -> bool:
   return True
 
 
-def detect_5m_candidate(
+def _detect_at(
     candles_5m: list[dict],
     candles_30m: list[dict],
     bias_30m: str,
@@ -215,3 +215,24 @@ def detect_5m_candidate(
   found["matrix_5m"] = matrix_5m
   found["matrix_30m"] = matrix_30m
   return found
+
+
+def detect_5m_candidate(
+    candles_5m: list[dict],
+    candles_30m: list[dict],
+    bias_30m: str,
+    aligned_3h: bool,
+    lookback_candles: int = 6,
+) -> dict | None:
+  """
+    ამოწმებს ბოლო `lookback_candles` ხუთწუთიან სანთელს (6 = 30 წუთი), რადგან
+    სკანირება ყოველ 30 წუთში ერთხელ ხდება. აბრუნებს ყველაზე ახალ პატერნს.
+    დუბლიკატებს main.py-ში alert_key (წყვილი+პატერნი+სანთლის დრო) აფილტრავს.
+    """
+  for k in range(lookback_candles):
+    subset = candles_5m[: len(candles_5m) - k]
+    found = _detect_at(subset, candles_30m, bias_30m, aligned_3h)
+    if found:
+      found["candles_ago"] = k
+      return found
+  return None

@@ -190,6 +190,7 @@ def main() -> None:
           f"30M Bias: <b>{bias_30m}</b> | Level: <b>{candidate['level']}</b>\n"
           f"5M Matrix (200/1.60): <b>{'YES' if m5['above_threshold'] else 'NO'}</b> "
           f"(x{m5['ratio']}) | 30M (150/1.50): x{m30['ratio']}\n"
+          f"სიგნალის სანთელი: {last_dt} ({candidate.get('candles_ago', 0) * 5} წთ-ის წინ)\n"
           f"TV Circle / 1M Delta: <i>გადასამოწმებელია TradingView-ზე</i>\n"
           f"Score: <b>{score}/10</b>\n"
           f"დრო: {now_tbilisi.strftime('%H:%M')} (თბილისი)\n"
