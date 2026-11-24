@@ -30,7 +30,11 @@ def evaluate_volume_matrix(
   last = candles[-1]
   last_vol = float(last.get("volume") or 0.0)
   hist = candles[-(lookback + 1) : -1] if len(candles) > 1 else []
-  vols = [float(c.get("volume") or 0.0) for c in hist if (c.get("volume") or 0.0) > 0]
+  vols = [
+      float(c.get("volume") or 0.0)
+      for c in hist
+      if (c.get("volume") or 0.0) > 0
+  ]
 
   sma_vol = mean(vols) if vols else 0.0
   threshold_vol = sma_vol * multiplier
@@ -120,12 +124,11 @@ def _detect_at(
     candles_30m: list[dict],
     bias_30m: str,
     aligned_3h: bool,
-    tol_ratio: float = 0.25,
+    tol_ratio: float = 0.20,
 ) -> dict | None:
   """
     5M ეტაპი (მხოლოდ 30M + 3H კონტექსტის შემდეგ):
-    1) Double Top / Double Bottom
-    2) V-Reversal
+    მხოლოდ Double Top / Double Bottom
     + Matrix v3.8 შეფასება 5M (200 / 1.60) და 30M (150 / 1.50) ტაიმფრეიმებზე.
     """
   if not aligned_3h or len(candles_5m) < 25:
@@ -145,66 +148,52 @@ def _detect_at(
 
   found: dict | None = None
 
-  # 1. Double Top / Double Bottom
+  # 1. Double Top (SHORT)
   window = candles_5m[-20:-1]
   if len(window) >= 10:
+    mid = len(window) // 2
     highs = [(i, c["high"]) for i, c in enumerate(window)]
-    h1_idx, h1_val = max(highs[: len(highs) // 2], key=lambda x: x[1])
-    h2_idx, h2_val = max(highs[len(highs) // 2 :], key=lambda x: x[1])
-    if (h2_idx - h1_idx) >= 5 and abs(h2_val - h1_val) <= tol:
-      if last["close"] < last["open"] and last_range >= avg_rng * 0.8:
-        found = {
-            "pattern": "DOUBLE_TOP",
-            "direction": "SHORT",
-            "bias_30m": bias_30m,
-            "level": round(mean([h1_val, h2_val]), 5),
-            "last_candle": last,
-            "impulse_ratio": round(last_body / last_range, 2),
-        }
+    h1_idx, h1_val = max(highs[:mid], key=lambda x: x[1])
+    h2_idx, h2_val = max(highs[mid:], key=lambda x: x[1])
+    trough_between = min(c["low"] for c in window[h1_idx : h2_idx + 1])
+    pullback_depth = min(h1_val, h2_val) - trough_between
 
+    if (
+        (h2_idx - h1_idx) >= 5
+        and abs(h2_val - h1_val) <= tol
+        and pullback_depth >= avg_rng * 0.6
+        and last["close"] < last["open"]
+        and last_range >= avg_rng * 0.85
+    ):
+      found = {
+          "pattern": "DOUBLE_TOP",
+          "direction": "SHORT",
+          "bias_30m": bias_30m,
+          "level": round(mean([h1_val, h2_val]), 5),
+          "last_candle": last,
+          "impulse_ratio": round(last_body / last_range, 2),
+      }
+
+    # 2. Double Bottom (LONG)
     if not found:
       lows = [(i, c["low"]) for i, c in enumerate(window)]
-      l1_idx, l1_val = min(lows[: len(lows) // 2], key=lambda x: x[1])
-      l2_idx, l2_val = min(lows[len(lows) // 2 :], key=lambda x: x[1])
-      if (l2_idx - l1_idx) >= 5 and abs(l2_val - l1_val) <= tol:
-        if last["close"] > last["open"] and last_range >= avg_rng * 0.8:
-          found = {
-              "pattern": "DOUBLE_BOTTOM",
-              "direction": "LONG",
-              "bias_30m": bias_30m,
-              "level": round(mean([l1_val, l2_val]), 5),
-              "last_candle": last,
-              "impulse_ratio": round(last_body / last_range, 2),
-          }
+      l1_idx, l1_val = min(lows[:mid], key=lambda x: x[1])
+      l2_idx, l2_val = min(lows[mid:], key=lambda x: x[1])
+      peak_between = max(c["high"] for c in window[l1_idx : l2_idx + 1])
+      rebound_height = peak_between - max(l1_val, l2_val)
 
-  # 2. V-Reversal
-  if not found:
-    prev_6 = candles_5m[-7:-1]
-    move_6 = prev_6[-1]["close"] - prev_6[0]["open"]
-    if abs(move_6) >= avg_rng * 2.2:
       if (
-          move_6 < 0
+          (l2_idx - l1_idx) >= 5
+          and abs(l2_val - l1_val) <= tol
+          and rebound_height >= avg_rng * 0.6
           and last["close"] > last["open"]
-          and last_range >= avg_rng * 1.1
+          and last_range >= avg_rng * 0.85
       ):
         found = {
-            "pattern": "V_REVERSAL",
+            "pattern": "DOUBLE_BOTTOM",
             "direction": "LONG",
             "bias_30m": bias_30m,
-            "level": round(min(c["low"] for c in prev_6), 5),
-            "last_candle": last,
-            "impulse_ratio": round(last_body / last_range, 2),
-        }
-      elif (
-          move_6 > 0
-          and last["close"] < last["open"]
-          and last_range >= avg_rng * 1.1
-      ):
-        found = {
-            "pattern": "V_REVERSAL",
-            "direction": "SHORT",
-            "bias_30m": bias_30m,
-            "level": round(max(c["high"] for c in prev_6), 5),
+            "level": round(mean([l1_val, l2_val]), 5),
             "last_candle": last,
             "impulse_ratio": round(last_body / last_range, 2),
         }
