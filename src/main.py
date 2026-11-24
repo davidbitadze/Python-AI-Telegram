@@ -89,6 +89,27 @@ def candidate_priority(item: dict) -> tuple:
   return (vol_ok, ratio, impulse)
 
 
+def send_ai_down_alert(item: dict, reason: str) -> bool:
+  """AI მიუწვდომელია -> მოკლე ტექნიკური შეტყობინება, რომ სიგნალი არ დაიკარგოს."""
+  cand = item["candidate"]
+  now = datetime.now(TBILISI_TZ).strftime("%H:%M")
+  msg = (
+      f"⚠️ AI მიუწვდომელია, ტექნიკური სიგნალი:\n"
+      f"<b>{item['pair']}</b> | {cand['pattern']} ({cand['direction']})\n"
+      f"30M Bias: <b>{item['bias_30m']}</b> | Level: <b>{cand['level']}</b>\n"
+      f"სიგნალის სანთელი: {cand['last_candle']['datetime']} "
+      f"({cand.get('candles_ago', 0) * 5} წთ-ის წინ)\n"
+      f"დრო: {now} (თბილისი)\n"
+      f"მიზეზი: {html.escape(reason)}"
+  )
+  try:
+    send_telegram_message(msg)
+    return True
+  except Exception as exc:
+    print(f"[{item['pair']}] ERROR sending AI-down Telegram: {exc}")
+    return False
+
+
 def main() -> None:
   if os.environ.get("TEST_TELEGRAM", "false").lower() == "true":
     run_telegram_test()
@@ -197,7 +218,12 @@ def main() -> None:
 
   for item in selected_for_ai:
     if quota_exhausted:
-      print(f"[{item['pair']}] Result: SKIPPED_QUOTA_EXHAUSTED")
+      print(f"[{item['pair']}] Result: QUOTA_EXHAUSTED -> technical alert")
+      if send_ai_down_alert(item, "Gemini-ს კვოტა ამოიწურა"):
+        state[item["alert_key"]] = now_tbilisi.isoformat()
+        state_changed = True
+        notified_count += 1
+        print(f"[{item['pair']}] Result: SENT_TELEGRAM (AI down)")
       continue
 
     pair = item["pair"]
@@ -220,7 +246,13 @@ def main() -> None:
       print(f"[{pair}] ERROR in AI evaluator: {err_str}")
       if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
         quota_exhausted = True
-      # AI შეცდომისას ტყუილად 0/10 სიგნალს ტელეგრამში აღარ ვაგზავნით
+      # AI ჩავარდა: ვაგზავნით მოკლე ტექნიკურ შეტყობინებას (არა 0/10 შეფასებას)
+      short = "კვოტა ამოიწურა" if quota_exhausted else "დროებითი შეცდომა"
+      if send_ai_down_alert(item, f"Gemini: {short}"):
+        state[alert_key] = now_tbilisi.isoformat()
+        state_changed = True
+        notified_count += 1
+        print(f"[{pair}] Result: SENT_TELEGRAM (AI down)")
       continue
 
     notify_flag = bool(evaluation.get("notify"))
@@ -239,7 +271,7 @@ def main() -> None:
           f"სიგნალის სანთელი: {last_dt} ({candidate.get('candles_ago', 0) * 5} წთ-ის წინ)\n"
           f"TV Circle / 1M Delta: <i>გადასამოწმებელია TradingView-ზე</i>\n"
           f"Score: <b>{score}/10</b>\n"
-          f"დრო: {now_tbilisi.strftime('%H:%M')} (თბილისი)\n"
+          f"დრო: {datetime.now(TBILISI_TZ).strftime('%H:%M')} (თბილისი)\n"
           f"ანალიზი: {html.escape(summary)}\n"
           f"⚠️ რისკი/შენიშვნა: {html.escape(evaluation.get('risk_and_caution', ''))}"
       )

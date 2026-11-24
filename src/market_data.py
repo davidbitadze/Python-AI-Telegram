@@ -16,8 +16,14 @@ def fetch_candles(pair: str, interval: str, outputsize: int = 120) -> list[dict]
       f"https://api.twelvedata.com/time_series?symbol={symbol}"
       f"&interval={interval}&outputsize={outputsize}&apikey={api_key}"
   )
-  with urllib.request.urlopen(url, timeout=20) as resp:
-    data = json.loads(resp.read().decode("utf-8"))
+  # დრო თბილისის ზონაში (ნაგულისხმევად ბირჟის ზონაა, ~+7სთ თბილისიდან)
+  def _get(u: str) -> dict:
+    with urllib.request.urlopen(u, timeout=20) as resp:
+      return json.loads(resp.read().decode("utf-8"))
+
+  data = _get(url + "&timezone=Asia%2FTbilisi")
+  if "values" not in data and "timezone" in str(data).lower():
+    data = _get(url)  # fallback: თუ timezone პარამეტრი არ მიიღეს
 
   if "values" not in data:
     raise RuntimeError(f"Failed fetching {pair} ({interval}): {data}")
