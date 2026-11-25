@@ -15,9 +15,7 @@ from technical_filter import confirm_3h_alignment, detect_5m_candidate, infer_30
 STATE_FILE = Path("state/sent_alerts.json")
 REQUEST_DELAY_SEC = 8.0  # Twelve Data free: 8 მოთხოვნა/წუთში
 ALLOWED_PATTERNS = {"DOUBLE_TOP", "DOUBLE_BOTTOM"}
-MAX_AI_EVALS_PER_RUN = 2  # დღიური 20-რექვესთიანი ლიმიტის დასაზოგად
-AI_503_RETRIES = 2
-AI_503_BACKOFFS = (3.0, 7.0)
+MAX_AI_EVALS_PER_RUN = 2  # დღიური ლიმიტის დასაზოგად
 
 
 def fetch_with_retry(
@@ -39,33 +37,6 @@ def fetch_with_retry(
             f"(retry {attempt + 1}/{max_retries})..."
         )
         time.sleep(backoff_sec)
-        continue
-      raise
-
-
-def evaluate_with_retry(pair: str, candidate: dict, tbilisi_now_str: str) -> dict:
-  """იძახებს Gemini-ს; დროებითი 503 შეცდომისას აკეთებს განმეორებით ცდებს."""
-  for attempt in range(AI_503_RETRIES + 1):
-    try:
-      return evaluate_candidate(
-          pair=pair,
-          candidate=candidate,
-          tbilisi_now_str=tbilisi_now_str,
-      )
-    except Exception as exc:
-      err_str = str(exc)
-      is_503 = (
-          "503" in err_str
-          or "UNAVAILABLE" in err_str
-          or "ServiceUnavailable" in err_str
-      )
-      if is_503 and attempt < AI_503_RETRIES:
-        wait_sec = AI_503_BACKOFFS[min(attempt, len(AI_503_BACKOFFS) - 1)]
-        print(
-            f"[{pair}] Gemini 503 transient error. Retrying in {wait_sec}s "
-            f"(attempt {attempt + 1}/{AI_503_RETRIES})..."
-        )
-        time.sleep(wait_sec)
         continue
       raise
 
@@ -170,11 +141,9 @@ def main() -> None:
   for pair in PAIRS:
     print(f"\n--- [{pair}] ---")
     try:
-      # 1. ჯერ 30M (SMA 150 / mult 1.50-ისთვის)
       candles_30m = fetch_with_retry(pair, "30min", outputsize=160)
       bias_30m = infer_30m_bias(candles_30m)
 
-      # 2. შემდეგ 1H -> 3H კონტექსტის დადასტურება
       candles_1h = fetch_with_retry(pair, "1h", outputsize=45)
       candles_3h = build_3h_from_1h(candles_1h)
       aligned_3h = confirm_3h_alignment(candles_3h, bias_30m)
@@ -187,7 +156,6 @@ def main() -> None:
         )
         continue
 
-      # 3. მხოლოდ 30M + 3H დადასტურების შემდეგ ვიღებთ 5M (SMA 200 / mult 1.60-ისთვის)
       candles_5m = fetch_with_retry(pair, "5min", outputsize=210)
     except Exception as exc:
       print(f"[{pair}] ERROR fetching data: {exc}")
@@ -237,7 +205,6 @@ def main() -> None:
         "alert_key": alert_key,
     })
 
-  # საუკეთესო კანდიდატების შერჩევა AI შეფასებისთვის (კვოტის დასაზოგად)
   queued_for_ai.sort(key=candidate_priority, reverse=True)
   selected_for_ai = queued_for_ai[:MAX_AI_EVALS_PER_RUN]
   skipped_cap = queued_for_ai[MAX_AI_EVALS_PER_RUN:]
@@ -265,7 +232,7 @@ def main() -> None:
 
     ai_evals_used += 1
     try:
-      evaluation = evaluate_with_retry(
+      evaluation = evaluate_candidate(
           pair=pair,
           candidate=candidate,
           tbilisi_now_str=now_tbilisi.strftime("%Y-%m-%d %H:%M"),
