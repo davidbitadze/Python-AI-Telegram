@@ -123,25 +123,24 @@ def _detect_at(
     candles_30m: list[dict],
     bias_30m: str,
     aligned_3h: bool,
-    tol_ratio: float = 0.20,
-    min_arch_candles: int = 14,
-    arch_dist_mult: float = 2.5,
+    min_pattern_candles: int = 14,
+    arch_mult_vs_first: float = 2.5,
+    max_pierce_mult: float = 0.35,
 ) -> dict | None:
   """
     5M ეტაპი (მხოლოდ 30M + 3H კონტექსტის შემდეგ):
-    მხოლოდ Double Top / Double Bottom:
-    - პიკებს/ძირებს შორის მინიმუმ `min_arch_candles` (14) სანთელი
-    - არკის უმაღლესი/უდაბლესი წერტილის დაშორება პიკებიდან/ძირებიდან >= `arch_dist_mult` (2.5) * tol
+    მხოლოდ Double Top / Double Bottom სტრუქტურული არკის წესით:
+    - მთლიან წყობაში მინიმუმ 14 სანთელი (საწყისი სანთლიდან ბოლომდე)
+    - შუალედური არკის გადახრა საწყისი სანთლის დიაპაზონთან >= 2.5x
+    - დონის „ჩახვრეტა“ (pierce) შეზღუდულია, რათა სტრუქტურა არ ჩაითვალოს დარღვეულად
     """
-  if not aligned_3h or len(candles_5m) < 42:
+  if not aligned_3h or len(candles_5m) < max(30, min_pattern_candles + 5):
     return None
 
   avg_rng = _avg_range(candles_5m, lookback=20)
   if avg_rng <= 0:
     return None
 
-  tol = max(avg_rng * tol_ratio, 1e-9)
-  min_arch_depth = tol * arch_dist_mult
   last = candles_5m[-1]
   last_body = abs(last["close"] - last["open"])
   last_range = max(last["high"] - last["low"], 1e-9)
@@ -150,85 +149,122 @@ def _detect_at(
   matrix_30m = evaluate_volume_matrix(candles_30m, lookback=150, multiplier=1.50)
 
   found: dict | None = None
-  window = candles_5m[-36:-1]
+  window = candles_5m[-40:]
+  n = len(window)
 
-  if len(window) >= min_arch_candles + 2:
-    # 1. Double Top (SHORT)
-    best_top = None
-    for i in range(len(window) - min_arch_candles - 1):
-      for j in range(i + min_arch_candles + 1, len(window)):
-        h1_val = window[i]["high"]
-        h2_val = window[j]["high"]
-        if abs(h2_val - h1_val) > tol:
-          continue
-        arch_candles = window[i + 1 : j]
-        if len(arch_candles) < min_arch_candles:
-          continue
-        trough_between = min(c["low"] for c in arch_candles)
-        arch_depth = min(h1_val, h2_val) - trough_between
-        if arch_depth >= min_arch_depth:
-          cand_score = arch_depth
-          if best_top is None or cand_score > best_top[0]:
-            best_top = (cand_score, h1_val, h2_val, len(arch_candles), arch_depth)
+  # 1. Double Bottom (LONG): საწყისი ძირი -> 2.5x არკა ზემოთ -> დაბრუნება დონეზე და ასხლეტვა ზემოთ
+  if last["close"] > last["open"] and last_range >= avg_rng * 0.8:
+    best_bottom = None
+    for start_idx in range(0, n - min_pattern_candles + 1):
+      first_c = window[start_idx]
+      first_rng = max(first_c["high"] - first_c["low"], 1e-9)
+      base_level = first_c["low"]
+      max_pierce = max(first_rng * max_pierce_mult, avg_rng * max_pierce_mult)
 
-    if (
-        best_top is not None
-        and last["close"] < last["open"]
-        and last_range >= avg_rng * 0.85
-    ):
-      _, h1_val, h2_val, arch_len, arch_depth = best_top
+      # ბოლო სანთელმა არ უნდა გაარღვიოს დონე ღრმად ქვემოთ
+      if last["low"] < (base_level - max_pierce):
+        continue
+
+      # შევამოწმოთ მეორე/რეტესტის ძირი window-ში (start_idx-დან მინიმუმ min_pattern_candles-1 სანთლის შემდეგ)
+      for retest_idx in range(start_idx + min_pattern_candles - 1, n):
+        arch_slice = window[start_idx + 1 : retest_idx]
+        if not arch_slice:
+          continue
+        arch_peak = max(c["high"] for c in arch_slice)
+        arch_span = arch_peak - base_level
+        if arch_span < first_rng * arch_mult_vs_first:
+          continue
+
+        retest_c = window[retest_idx]
+        # არც შუალედურ რეტესტს არ უნდა ჰქონდეს ღრმა გარღვევა ქვემოთ
+        if any(
+            c["low"] < (base_level - max_pierce)
+            for c in window[start_idx + 1 : retest_idx + 1]
+        ):
+          continue
+
+        # დონესთან სიახლოვე / ასხლეტვის რეინჯი
+        retest_dist = abs(retest_c["low"] - base_level)
+        if retest_dist <= max(first_rng * 0.5, avg_rng * 0.5):
+          total_len = retest_idx - start_idx + 1
+          if total_len >= min_pattern_candles:
+            score = arch_span / first_rng
+            if best_bottom is None or score > best_bottom[0]:
+              best_bottom = (
+                  score,
+                  base_level,
+                  retest_c["low"],
+                  total_len,
+                  round(score, 2),
+              )
+
+    if best_bottom is not None:
+      _, base_lvl, retest_lvl, total_len, arch_mult_actual = best_bottom
       found = {
-          "pattern": "DOUBLE_TOP",
-          "direction": "SHORT",
+          "pattern": "DOUBLE_BOTTOM",
+          "direction": "LONG",
           "bias_30m": bias_30m,
-          "level": round(mean([h1_val, h2_val]), 5),
-          "arch_candles": arch_len,
-          "arch_depth_to_tol": round(arch_depth / tol, 2),
+          "level": round(mean([base_lvl, retest_lvl]), 5),
+          "pattern_candles": total_len,
+          "arch_vs_first_mult": arch_mult_actual,
           "last_candle": last,
           "impulse_ratio": round(last_body / last_range, 2),
       }
 
-    # 2. Double Bottom (LONG)
-    if not found:
-      best_bottom = None
-      for i in range(len(window) - min_arch_candles - 1):
-        for j in range(i + min_arch_candles + 1, len(window)):
-          l1_val = window[i]["low"]
-          l2_val = window[j]["low"]
-          if abs(l2_val - l1_val) > tol:
-            continue
-          arch_candles = window[i + 1 : j]
-          if len(arch_candles) < min_arch_candles:
-            continue
-          peak_between = max(c["high"] for c in arch_candles)
-          arch_height = peak_between - max(l1_val, l2_val)
-          if arch_height >= min_arch_depth:
-            cand_score = arch_height
-            if best_bottom is None or cand_score > best_bottom[0]:
-              best_bottom = (
-                  cand_score,
-                  l1_val,
-                  l2_val,
-                  len(arch_candles),
-                  arch_height,
+  # 2. Double Top (SHORT): საწყისი პიკი -> 2.5x არკა ქვემოთ -> დაბრუნება დონეზე და ასხლეტვა ქვემოთ
+  if not found and last["close"] < last["open"] and last_range >= avg_rng * 0.8:
+    best_top = None
+    for start_idx in range(0, n - min_pattern_candles + 1):
+      first_c = window[start_idx]
+      first_rng = max(first_c["high"] - first_c["low"], 1e-9)
+      base_level = first_c["high"]
+      max_pierce = max(first_rng * max_pierce_mult, avg_rng * max_pierce_mult)
+
+      if last["high"] > (base_level + max_pierce):
+        continue
+
+      for retest_idx in range(start_idx + min_pattern_candles - 1, n):
+        arch_slice = window[start_idx + 1 : retest_idx]
+        if not arch_slice:
+          continue
+        arch_trough = min(c["low"] for c in arch_slice)
+        arch_span = base_level - arch_trough
+        if arch_span < first_rng * arch_mult_vs_first:
+          continue
+
+        retest_c = window[retest_idx]
+        if any(
+            c["high"] > (base_level + max_pierce)
+            for c in window[start_idx + 1 : retest_idx + 1]
+        ):
+          continue
+
+        retest_dist = abs(retest_c["high"] - base_level)
+        if retest_dist <= max(first_rng * 0.5, avg_rng * 0.5):
+          total_len = retest_idx - start_idx + 1
+          if total_len >= min_pattern_candles:
+            score = arch_span / first_rng
+            if best_top is None or score > best_top[0]:
+              best_top = (
+                  score,
+                  base_level,
+                  retest_c["high"],
+                  total_len,
+                  round(score, 2),
               )
 
-      if (
-          best_bottom is not None
-          and last["close"] > last["open"]
-          and last_range >= avg_rng * 0.85
-      ):
-        _, l1_val, l2_val, arch_len, arch_height = best_bottom
-        found = {
-            "pattern": "DOUBLE_BOTTOM",
-            "direction": "LONG",
-            "bias_30m": bias_30m,
-            "level": round(mean([l1_val, l2_val]), 5),
-            "arch_candles": arch_len,
-            "arch_depth_to_tol": round(arch_height / tol, 2),
-            "last_candle": last,
-            "impulse_ratio": round(last_body / last_range, 2),
-        }
+    if best_top is not None:
+      _, base_lvl, retest_lvl, total_len, arch_mult_actual = best_top
+      found = {
+          "pattern": "DOUBLE_TOP",
+          "direction": "SHORT",
+          "bias_30m": bias_30m,
+          "level": round(mean([base_lvl, retest_lvl]), 5),
+          "pattern_candles": total_len,
+          "arch_vs_first_mult": arch_mult_actual,
+          "last_candle": last,
+          "impulse_ratio": round(last_body / last_range, 2),
+      }
 
   if not found:
     return None
