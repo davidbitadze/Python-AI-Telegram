@@ -30,6 +30,7 @@ def _is_daily_quota_error(err_str: str) -> bool:
       "RESOURCE_EXHAUSTED" in err_str
       or "PerDay" in err_str
       or "per day limit exceeded" in err_str.lower()
+      or "429" in err_str
   )
 
 
@@ -47,7 +48,7 @@ def evaluate_candidate(pair: str, candidate: dict, tbilisi_now_str: str) -> dict
   if not api_key:
     raise RuntimeError("GEMINI_API_KEY არ არის დაყენებული გარემოში.")
 
-  primary_model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+  primary_model = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
   fallback_model = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
   models_to_try = [primary_model]
   if fallback_model and fallback_model != primary_model:
