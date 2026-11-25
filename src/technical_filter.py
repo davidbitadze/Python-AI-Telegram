@@ -161,11 +161,9 @@ def _detect_at(
       base_level = first_c["low"]
       max_pierce = max(first_rng * max_pierce_mult, avg_rng * max_pierce_mult)
 
-      # ბოლო სანთელმა არ უნდა გაარღვიოს დონე ღრმად ქვემოთ
       if last["low"] < (base_level - max_pierce):
         continue
 
-      # შევამოწმოთ მეორე/რეტესტის ძირი window-ში (start_idx-დან მინიმუმ min_pattern_candles-1 სანთლის შემდეგ)
       for retest_idx in range(start_idx + min_pattern_candles - 1, n):
         arch_slice = window[start_idx + 1 : retest_idx]
         if not arch_slice:
@@ -176,14 +174,12 @@ def _detect_at(
           continue
 
         retest_c = window[retest_idx]
-        # არც შუალედურ რეტესტს არ უნდა ჰქონდეს ღრმა გარღვევა ქვემოთ
         if any(
             c["low"] < (base_level - max_pierce)
             for c in window[start_idx + 1 : retest_idx + 1]
         ):
           continue
 
-        # დონესთან სიახლოვე / ასხლეტვის რეინჯი
         retest_dist = abs(retest_c["low"] - base_level)
         if retest_dist <= max(first_rng * 0.5, avg_rng * 0.5):
           total_len = retest_idx - start_idx + 1
@@ -293,3 +289,6 @@ def detect_5m_candidate(
       found["candles_ago"] = k
       return found
   return None
+```[cite: 26]
+
+ჩასვამ, დააკომიტებ და გაუშვებ ხელახლა — და მერე პირველივე გაშვების შედეგს და ლოგს შევხედოთ.
