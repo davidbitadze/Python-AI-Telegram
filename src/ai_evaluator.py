@@ -48,7 +48,7 @@ def evaluate_candidate(pair: str, candidate: dict, tbilisi_now_str: str) -> dict
     raise RuntimeError("GEMINI_API_KEY არ არის დაყენებული გარემოში.")
 
   primary_model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-  fallback_model = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+  fallback_model = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
   models_to_try = [primary_model]
   if fallback_model and fallback_model != primary_model:
     models_to_try.append(fallback_model)
