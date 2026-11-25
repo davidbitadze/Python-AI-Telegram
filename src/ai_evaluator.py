@@ -25,15 +25,27 @@ SYSTEM_PROMPT = """
 """
 
 
+def _is_daily_quota_error(err_str: str) -> bool:
+  return (
+      "RESOURCE_EXHAUSTED" in err_str
+      or "PerDay" in err_str
+      or "per day limit exceeded" in err_str.lower()
+  )
+
+
+def _is_transient_503(err_str: str) -> bool:
+  return (
+      "503" in err_str
+      or "UNAVAILABLE" in err_str
+      or "ServiceUnavailable" in err_str
+      or "high demand" in err_str.lower()
+  )
+
+
 def evaluate_candidate(pair: str, candidate: dict, tbilisi_now_str: str) -> dict:
   api_key = os.environ.get("GEMINI_API_KEY")
   if not api_key:
-    return {
-        "notify": True,
-        "quality_score": 7,
-        "setup_summary": f"{candidate['pattern']} ({candidate['direction']}) on level {candidate['level']} [30M: {candidate['bias_30m']}]",
-        "risk_and_caution": "GEMINI_API_KEY არ არის დაყენებული; გაიგზავნა ტექნიკური ფილტრის კანდიდატი.",
-    }
+    raise RuntimeError("GEMINI_API_KEY არ არის დაყენებული გარემოში.")
 
   client = genai.Client(api_key=api_key)
   prompt = (
@@ -44,13 +56,19 @@ def evaluate_candidate(pair: str, candidate: dict, tbilisi_now_str: str) -> dict
   )
 
   last_exc = None
-  for attempt in range(3):
+  max_retries = 2
+  for attempt in range(max_retries + 1):
     try:
       response = _generate(client, prompt)
+      if not response.text:
+        raise ValueError("Gemini-მ ცარიელი პასუხი დააბრუნა.")
       return json.loads(response.text)
-    except Exception as exc:  # 503/429 დროებითი გადატვირთვა -> ვცდით თავიდან
+    except Exception as exc:
       last_exc = exc
-      if attempt < 2 and any(c in str(exc) for c in ("503", "429", "UNAVAILABLE")):
+      err_str = str(exc)
+      if _is_daily_quota_error(err_str):
+        raise
+      if _is_transient_503(err_str) and attempt < max_retries:
         time.sleep(15 * (attempt + 1))
         continue
       raise
