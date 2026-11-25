@@ -52,7 +52,6 @@ def evaluate_volume_matrix(
   body = last["close"] - last["open"]
   body_strength = round(abs(body) / rng, 2)
 
-  # პროქსი-მინიშნება: სანთლის მიმართულება და სხეულის სიმკვრივე
   if not above_threshold:
     proxy_hint = "BELOW_THRESHOLD"
   elif candle_dir == "BULLISH" and body_strength >= 0.45:
@@ -125,20 +124,24 @@ def _detect_at(
     bias_30m: str,
     aligned_3h: bool,
     tol_ratio: float = 0.20,
+    min_arch_candles: int = 14,
+    arch_dist_mult: float = 2.5,
 ) -> dict | None:
   """
     5M ეტაპი (მხოლოდ 30M + 3H კონტექსტის შემდეგ):
-    მხოლოდ Double Top / Double Bottom
-    + Matrix v3.8 შეფასება 5M (200 / 1.60) და 30M (150 / 1.50) ტაიმფრეიმებზე.
+    მხოლოდ Double Top / Double Bottom:
+    - პიკებს/ძირებს შორის მინიმუმ `min_arch_candles` (14) სანთელი
+    - არკის უმაღლესი/უდაბლესი წერტილის დაშორება პიკებიდან/ძირებიდან >= `arch_dist_mult` (2.5) * tol
     """
-  if not aligned_3h or len(candles_5m) < 25:
+  if not aligned_3h or len(candles_5m) < 42:
     return None
 
   avg_rng = _avg_range(candles_5m, lookback=20)
   if avg_rng <= 0:
     return None
 
-  tol = avg_rng * tol_ratio
+  tol = max(avg_rng * tol_ratio, 1e-9)
+  min_arch_depth = tol * arch_dist_mult
   last = candles_5m[-1]
   last_body = abs(last["close"] - last["open"])
   last_range = max(last["high"] - last["low"], 1e-9)
@@ -147,53 +150,82 @@ def _detect_at(
   matrix_30m = evaluate_volume_matrix(candles_30m, lookback=150, multiplier=1.50)
 
   found: dict | None = None
+  window = candles_5m[-36:-1]
 
-  # 1. Double Top (SHORT)
-  window = candles_5m[-20:-1]
-  if len(window) >= 10:
-    mid = len(window) // 2
-    highs = [(i, c["high"]) for i, c in enumerate(window)]
-    h1_idx, h1_val = max(highs[:mid], key=lambda x: x[1])
-    h2_idx, h2_val = max(highs[mid:], key=lambda x: x[1])
-    trough_between = min(c["low"] for c in window[h1_idx : h2_idx + 1])
-    pullback_depth = min(h1_val, h2_val) - trough_between
+  if len(window) >= min_arch_candles + 2:
+    # 1. Double Top (SHORT)
+    best_top = None
+    for i in range(len(window) - min_arch_candles - 1):
+      for j in range(i + min_arch_candles + 1, len(window)):
+        h1_val = window[i]["high"]
+        h2_val = window[j]["high"]
+        if abs(h2_val - h1_val) > tol:
+          continue
+        arch_candles = window[i + 1 : j]
+        if len(arch_candles) < min_arch_candles:
+          continue
+        trough_between = min(c["low"] for c in arch_candles)
+        arch_depth = min(h1_val, h2_val) - trough_between
+        if arch_depth >= min_arch_depth:
+          cand_score = arch_depth
+          if best_top is None or cand_score > best_top[0]:
+            best_top = (cand_score, h1_val, h2_val, len(arch_candles), arch_depth)
 
     if (
-        (h2_idx - h1_idx) >= 5
-        and abs(h2_val - h1_val) <= tol
-        and pullback_depth >= avg_rng * 0.6
+        best_top is not None
         and last["close"] < last["open"]
         and last_range >= avg_rng * 0.85
     ):
+      _, h1_val, h2_val, arch_len, arch_depth = best_top
       found = {
           "pattern": "DOUBLE_TOP",
           "direction": "SHORT",
           "bias_30m": bias_30m,
           "level": round(mean([h1_val, h2_val]), 5),
+          "arch_candles": arch_len,
+          "arch_depth_to_tol": round(arch_depth / tol, 2),
           "last_candle": last,
           "impulse_ratio": round(last_body / last_range, 2),
       }
 
     # 2. Double Bottom (LONG)
     if not found:
-      lows = [(i, c["low"]) for i, c in enumerate(window)]
-      l1_idx, l1_val = min(lows[:mid], key=lambda x: x[1])
-      l2_idx, l2_val = min(lows[mid:], key=lambda x: x[1])
-      peak_between = max(c["high"] for c in window[l1_idx : l2_idx + 1])
-      rebound_height = peak_between - max(l1_val, l2_val)
+      best_bottom = None
+      for i in range(len(window) - min_arch_candles - 1):
+        for j in range(i + min_arch_candles + 1, len(window)):
+          l1_val = window[i]["low"]
+          l2_val = window[j]["low"]
+          if abs(l2_val - l1_val) > tol:
+            continue
+          arch_candles = window[i + 1 : j]
+          if len(arch_candles) < min_arch_candles:
+            continue
+          peak_between = max(c["high"] for c in arch_candles)
+          arch_height = peak_between - max(l1_val, l2_val)
+          if arch_height >= min_arch_depth:
+            cand_score = arch_height
+            if best_bottom is None or cand_score > best_bottom[0]:
+              best_bottom = (
+                  cand_score,
+                  l1_val,
+                  l2_val,
+                  len(arch_candles),
+                  arch_height,
+              )
 
       if (
-          (l2_idx - l1_idx) >= 5
-          and abs(l2_val - l1_val) <= tol
-          and rebound_height >= avg_rng * 0.6
+          best_bottom is not None
           and last["close"] > last["open"]
           and last_range >= avg_rng * 0.85
       ):
+        _, l1_val, l2_val, arch_len, arch_height = best_bottom
         found = {
             "pattern": "DOUBLE_BOTTOM",
             "direction": "LONG",
             "bias_30m": bias_30m,
             "level": round(mean([l1_val, l2_val]), 5),
+            "arch_candles": arch_len,
+            "arch_depth_to_tol": round(arch_height / tol, 2),
             "last_candle": last,
             "impulse_ratio": round(last_body / last_range, 2),
         }
