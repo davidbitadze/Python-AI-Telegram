@@ -1,4 +1,30 @@
+from datetime import datetime, timedelta
 from statistics import mean
+
+
+def _parse_dt(dt_str: str | None) -> datetime | None:
+  if not dt_str:
+    return None
+  for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+    try:
+      return datetime.strptime(dt_str[:19], fmt)
+    except ValueError:
+      continue
+  return None
+
+
+def _filter_last_hours(candles: list[dict], hours: float = 36.0) -> list[dict]:
+  """ტოვებს მხოლოდ ბოლო `hours` (ნაგულისხმებად 36 საათის) სანთლებს."""
+  if not candles:
+    return []
+  parsed = [(c, _parse_dt(c.get("datetime"))) for c in candles]
+  valid_dts = [dt for _, dt in parsed if dt is not None]
+  if not valid_dts:
+    max_bars = int(hours * 12)
+    return candles[-max_bars:]
+  latest_dt = max(valid_dts)
+  cutoff = latest_dt - timedelta(hours=hours)
+  return [c for c, dt in parsed if dt is not None and dt >= cutoff]
 
 
 def _avg_range(candles: list[dict], lookback: int = 20) -> float:
@@ -7,6 +33,27 @@ def _avg_range(candles: list[dict], lookback: int = 20) -> float:
   subset = candles[-lookback:]
   ranges = [max(0.0, c["high"] - c["low"]) for c in subset]
   return mean(ranges) if ranges else 0.0
+
+
+def _has_early_impulse_and_closeback(
+    arch_slice: list[dict], avg_rng: float, direction: str
+) -> bool:
+  """
+    ამოწმებს, იყო თუ არა არკის დასაწყის 1-3 სანთელში იმპულსური გასროლა
+    და შემდეგ უკან ჩახურვა/კორექცია.
+    """
+  early = arch_slice[:3]
+  for c in early:
+    rng = max(c["high"] - c["low"], 1e-9)
+    body = abs(c["close"] - c["open"])
+    is_impulse = rng >= avg_rng * 1.15 and (body / rng) >= 0.45
+    if not is_impulse:
+      continue
+    if direction == "LONG" and c["close"] <= c["open"] + rng * 0.35:
+      return True
+    if direction == "SHORT" and c["close"] >= c["open"] - rng * 0.35:
+      return True
+  return False
 
 
 def evaluate_volume_matrix(
@@ -126,22 +173,23 @@ def _detect_at(
     min_pattern_candles: int = 14,
     arch_mult_vs_first: float = 2.5,
     max_pierce_mult: float = 0.35,
+    max_age_hours: float = 36.0,
 ) -> dict | None:
   """
     5M ეტაპი (მხოლოდ 30M + 3H კონტექსტის შემდეგ):
-    მხოლოდ Double Top / Double Bottom სტრუქტურული არკის წესით:
-    - მთლიან წყობაში მინიმუმ 14 სანთელი (საწყისი სანთლიდან ბოლომდე)
-    - შუალედური არკის გადახრა საწყისი სანთლის დიაპაზონთან >= 2.5x
-    - დონის „ჩახვრეტა“ (pierce) შეზღუდულია, რათა სტრუქტურა არ ჩაითვალოს დარღვეულად
+    1) ფანჯარა იზღუდება ბოლო `max_age_hours` (36 საათით).
+    2) საწყისი მიბჯენა -> არკის ფორმირება (>= 2.5x საწყისი სანთლის დიაპაზონთან) -> მეორე მიბჯენა დონეზე.
+    3) მთლიანი სტრუქტურა: მინიმუმ 14 სანთელი, ღრმა ჩახვრეტის გარეშე.
     """
-  if not aligned_3h or len(candles_5m) < max(30, min_pattern_candles + 5):
+  recent_5m = _filter_last_hours(candles_5m, hours=max_age_hours)
+  if not aligned_3h or len(recent_5m) < max(20, min_pattern_candles + 2):
     return None
 
-  avg_rng = _avg_range(candles_5m, lookback=20)
+  avg_rng = _avg_range(recent_5m, lookback=20)
   if avg_rng <= 0:
     return None
 
-  last = candles_5m[-1]
+  last = recent_5m[-1]
   last_body = abs(last["close"] - last["open"])
   last_range = max(last["high"] - last["low"], 1e-9)
 
@@ -149,10 +197,10 @@ def _detect_at(
   matrix_30m = evaluate_volume_matrix(candles_30m, lookback=150, multiplier=1.50)
 
   found: dict | None = None
-  window = candles_5m[-40:]
+  window = recent_5m[-min(len(recent_5m), 96) :]
   n = len(window)
 
-  # 1. Double Bottom (LONG): საწყისი ძირი -> 2.5x არკა ზემოთ -> დაბრუნება დონეზე და ასხლეტვა ზემოთ
+  # 1. Double Bottom (LONG)
   if last["close"] > last["open"] and last_range >= avg_rng * 0.8:
     best_bottom = None
     for start_idx in range(0, n - min_pattern_candles + 1):
@@ -164,7 +212,8 @@ def _detect_at(
       if last["low"] < (base_level - max_pierce):
         continue
 
-      for retest_idx in range(start_idx + min_pattern_candles - 1, n):
+      min_retest_idx = start_idx + min_pattern_candles - 1
+      for retest_idx in range(min_retest_idx, n):
         arch_slice = window[start_idx + 1 : retest_idx]
         if not arch_slice:
           continue
@@ -183,31 +232,40 @@ def _detect_at(
         retest_dist = abs(retest_c["low"] - base_level)
         if retest_dist <= max(first_rng * 0.5, avg_rng * 0.5):
           total_len = retest_idx - start_idx + 1
-          if total_len >= min_pattern_candles:
-            score = arch_span / first_rng
-            if best_bottom is None or score > best_bottom[0]:
-              best_bottom = (
-                  score,
-                  base_level,
-                  retest_c["low"],
-                  total_len,
-                  round(score, 2),
-              )
+          early_imp_close = _has_early_impulse_and_closeback(
+              arch_slice, avg_rng, "LONG"
+          )
+          score = (arch_span / first_rng) + (0.25 if early_imp_close else 0.0)
+          if best_bottom is None or score > best_bottom[0]:
+            best_bottom = (
+                score,
+                base_level,
+                retest_c["low"],
+                total_len,
+                round(arch_span / first_rng, 2),
+                first_c["datetime"],
+                early_imp_close,
+            )
 
     if best_bottom is not None:
-      _, base_lvl, retest_lvl, total_len, arch_mult_actual = best_bottom
+      _, base_lvl, retest_lvl, total_len, arch_mult_actual, start_dt, early_imp_close = (
+          best_bottom
+      )
       found = {
           "pattern": "DOUBLE_BOTTOM",
           "direction": "LONG",
           "bias_30m": bias_30m,
           "level": round(mean([base_lvl, retest_lvl]), 5),
+          "arch_start_dt": start_dt,
           "pattern_candles": total_len,
           "arch_vs_first_mult": arch_mult_actual,
+          "early_impulse_closeback": early_imp_close,
+          "max_age_hours": max_age_hours,
           "last_candle": last,
           "impulse_ratio": round(last_body / last_range, 2),
       }
 
-  # 2. Double Top (SHORT): საწყისი პიკი -> 2.5x არკა ქვემოთ -> დაბრუნება დონეზე და ასხლეტვა ქვემოთ
+  # 2. Double Top (SHORT)
   if not found and last["close"] < last["open"] and last_range >= avg_rng * 0.8:
     best_top = None
     for start_idx in range(0, n - min_pattern_candles + 1):
@@ -219,7 +277,8 @@ def _detect_at(
       if last["high"] > (base_level + max_pierce):
         continue
 
-      for retest_idx in range(start_idx + min_pattern_candles - 1, n):
+      min_retest_idx = start_idx + min_pattern_candles - 1
+      for retest_idx in range(min_retest_idx, n):
         arch_slice = window[start_idx + 1 : retest_idx]
         if not arch_slice:
           continue
@@ -238,26 +297,35 @@ def _detect_at(
         retest_dist = abs(retest_c["high"] - base_level)
         if retest_dist <= max(first_rng * 0.5, avg_rng * 0.5):
           total_len = retest_idx - start_idx + 1
-          if total_len >= min_pattern_candles:
-            score = arch_span / first_rng
-            if best_top is None or score > best_top[0]:
-              best_top = (
-                  score,
-                  base_level,
-                  retest_c["high"],
-                  total_len,
-                  round(score, 2),
-              )
+          early_imp_close = _has_early_impulse_and_closeback(
+              arch_slice, avg_rng, "SHORT"
+          )
+          score = (arch_span / first_rng) + (0.25 if early_imp_close else 0.0)
+          if best_top is None or score > best_top[0]:
+            best_top = (
+                score,
+                base_level,
+                retest_c["high"],
+                total_len,
+                round(arch_span / first_rng, 2),
+                first_c["datetime"],
+                early_imp_close,
+            )
 
     if best_top is not None:
-      _, base_lvl, retest_lvl, total_len, arch_mult_actual = best_top
+      _, base_lvl, retest_lvl, total_len, arch_mult_actual, start_dt, early_imp_close = (
+          best_top
+      )
       found = {
           "pattern": "DOUBLE_TOP",
           "direction": "SHORT",
           "bias_30m": bias_30m,
           "level": round(mean([base_lvl, retest_lvl]), 5),
+          "arch_start_dt": start_dt,
           "pattern_candles": total_len,
           "arch_vs_first_mult": arch_mult_actual,
+          "early_impulse_closeback": early_imp_close,
+          "max_age_hours": max_age_hours,
           "last_candle": last,
           "impulse_ratio": round(last_body / last_range, 2),
       }
@@ -289,6 +357,3 @@ def detect_5m_candidate(
       found["candles_ago"] = k
       return found
   return None
-```[cite: 26]
-
-ჩასვამ, დააკომიტებ და გაუშვებ ხელახლა — და მერე პირველივე გაშვების შედეგს და ლოგს შევხედოთ.
