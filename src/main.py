@@ -16,6 +16,8 @@ STATE_FILE = Path("state/sent_alerts.json")
 REQUEST_DELAY_SEC = 8.0  # Twelve Data free: 8 მოთხოვნა/წუთში
 ALLOWED_PATTERNS = {"DOUBLE_TOP", "DOUBLE_BOTTOM"}
 MAX_AI_EVALS_PER_RUN = 2  # დღიური 20-რექვესთიანი ლიმიტის დასაზოგად
+AI_503_RETRIES = 2
+AI_503_BACKOFFS = (3.0, 7.0)
 
 
 def fetch_with_retry(
@@ -37,6 +39,33 @@ def fetch_with_retry(
             f"(retry {attempt + 1}/{max_retries})..."
         )
         time.sleep(backoff_sec)
+        continue
+      raise
+
+
+def evaluate_with_retry(pair: str, candidate: dict, tbilisi_now_str: str) -> dict:
+  """იძახებს Gemini-ს; დროებითი 503 შეცდომისას აკეთებს განმეორებით ცდებს."""
+  for attempt in range(AI_503_RETRIES + 1):
+    try:
+      return evaluate_candidate(
+          pair=pair,
+          candidate=candidate,
+          tbilisi_now_str=tbilisi_now_str,
+      )
+    except Exception as exc:
+      err_str = str(exc)
+      is_503 = (
+          "503" in err_str
+          or "UNAVAILABLE" in err_str
+          or "ServiceUnavailable" in err_str
+      )
+      if is_503 and attempt < AI_503_RETRIES:
+        wait_sec = AI_503_BACKOFFS[min(attempt, len(AI_503_BACKOFFS) - 1)]
+        print(
+            f"[{pair}] Gemini 503 transient error. Retrying in {wait_sec}s "
+            f"(attempt {attempt + 1}/{AI_503_RETRIES})..."
+        )
+        time.sleep(wait_sec)
         continue
       raise
 
@@ -236,7 +265,7 @@ def main() -> None:
 
     ai_evals_used += 1
     try:
-      evaluation = evaluate_candidate(
+      evaluation = evaluate_with_retry(
           pair=pair,
           candidate=candidate,
           tbilisi_now_str=now_tbilisi.strftime("%Y-%m-%d %H:%M"),
@@ -246,7 +275,6 @@ def main() -> None:
       print(f"[{pair}] ERROR in AI evaluator: {err_str}")
       if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
         quota_exhausted = True
-      # AI ჩავარდა: ვაგზავნით მოკლე ტექნიკურ შეტყობინებას (არა 0/10 შეფასებას)
       short = "კვოტა ამოიწურა" if quota_exhausted else "დროებითი შეცდომა"
       if send_ai_down_alert(item, f"Gemini: {short}"):
         state[alert_key] = now_tbilisi.isoformat()
