@@ -33,12 +33,14 @@ SYSTEM_PROMPT = """
 
 
 def _is_daily_quota_error(err_str: str) -> bool:
-  return (
-      "RESOURCE_EXHAUSTED" in err_str
-      or "PerDay" in err_str
-      or "per day limit exceeded" in err_str.lower()
-      or "429" in err_str
-  )
+  """დღიური კვოტა (RPD): ამ მოდელზე გაგრძელებას აზრი არ აქვს -> სარეზერვო მოდელი."""
+  low = err_str.lower()
+  return "perday" in low or "per day" in low or "daily" in low
+
+
+def _is_minute_rate_limit(err_str: str) -> bool:
+  """წუთობრივი ლიმიტი (RPM): საკმარისია ცოტა ხნის მოცდა."""
+  return ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and not _is_daily_quota_error(err_str)
 
 
 def _is_transient_503(err_str: str) -> bool:
@@ -55,8 +57,8 @@ def evaluate_candidate(pair: str, candidate: dict, tbilisi_now_str: str) -> dict
   if not api_key:
     raise RuntimeError("GEMINI_API_KEY არ არის დაყენებული გარემოში.")
 
-  primary_model = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
-  fallback_model = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
+  primary_model = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+  fallback_model = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.8-flash")
   models_to_try = [primary_model]
   if fallback_model and fallback_model != primary_model:
     models_to_try.append(fallback_model)
@@ -84,6 +86,9 @@ def evaluate_candidate(pair: str, candidate: dict, tbilisi_now_str: str) -> dict
         err_str = str(exc)
         if _is_daily_quota_error(err_str):
           break
+        if _is_minute_rate_limit(err_str) and attempt < 1:
+          time.sleep(20)
+          continue
         if _is_transient_503(err_str) and attempt < max_retries:
           time.sleep(10 * (attempt + 1))
           continue

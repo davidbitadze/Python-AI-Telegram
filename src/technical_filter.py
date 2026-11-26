@@ -187,6 +187,88 @@ def confirm_3h_alignment(candles_3h: list[dict], bias_30m: str) -> bool:
   return True
 
 
+def _find_double_pattern(
+    window: list[dict],
+    avg_rng: float,
+    direction: str,
+    last: dict,
+    min_pattern_candles: int,
+    arch_mult_vs_first: float,
+    arch_min_avg_mult: float,
+    max_pierce_mult: float,
+    retest_recent: int,
+    pre_bars: int,
+) -> tuple | None:
+  """
+    ზოგადი Double Bottom (LONG) / Double Top (SHORT) ძებნა.
+    SHORT-ზე ფასები სარკისებურად გადაიქცევა, ამიტომ ლოგიკა ერთია.
+    დამატებითი ფილტრები (ხმაურის წინააღმდეგ):
+    - საწყისი სანთელი რეალური ექსტრემუმია წინა `pre_bars` სანთელთან შედარებით;
+    - არკის სიღრმე >= arch_mult_vs_first x საწყისი სანთელი და
+      >= arch_min_avg_mult x საშუალო დიაპაზონი (პაწაწინა სანთლით "შეღწევა" აღარ გამოვა);
+    - მეორე შეხება (retest) ბოლო `retest_recent` სანთელშია, ანუ სიგნალის სანთელს უკავშირდება.
+    """
+  n = len(window)
+  if direction == "LONG":
+    ext = [c["low"] for c in window]
+    opp = [c["high"] for c in window]
+    last_ext = last["low"]
+    sign = 1.0
+  else:
+    ext = [-c["high"] for c in window]
+    opp = [-c["low"] for c in window]
+    last_ext = -last["high"]
+    sign = -1.0
+
+  best = None
+  first_retest_floor = max(0, n - retest_recent)
+  for start_idx in range(pre_bars, n - min_pattern_candles + 1):
+    first_c = window[start_idx]
+    first_rng = max(first_c["high"] - first_c["low"], 1e-9)
+    base_level = ext[start_idx]
+    max_pierce = max(first_rng * max_pierce_mult, avg_rng * max_pierce_mult)
+
+    # საწყისი სანთელი წინა სანთლებზე დაბალი (ან ტოლი) უნდა იყოს
+    if base_level > min(ext[start_idx - pre_bars : start_idx]):
+      continue
+    if last_ext < base_level - max_pierce:
+      continue
+
+    min_span = max(first_rng * arch_mult_vs_first, avg_rng * arch_min_avg_mult)
+    for retest_idx in range(
+        max(start_idx + min_pattern_candles - 1, first_retest_floor), n
+    ):
+      arch_slice_opp = opp[start_idx + 1 : retest_idx]
+      if not arch_slice_opp:
+        continue
+      arch_span = max(arch_slice_opp) - base_level
+      if arch_span < min_span:
+        continue
+      if any(
+          ext[i] < base_level - max_pierce
+          for i in range(start_idx + 1, retest_idx + 1)
+      ):
+        continue
+      retest_dist = abs(ext[retest_idx] - base_level)
+      if retest_dist > max(first_rng * 0.5, avg_rng * 0.5):
+        continue
+
+      arch_slice = window[start_idx + 1 : retest_idx]
+      early = _has_early_impulse_and_closeback(arch_slice, avg_rng, direction)
+      score = (arch_span / first_rng) + (0.25 if early else 0.0)
+      if best is None or score > best[0]:
+        best = (
+            score,
+            sign * base_level,
+            sign * ext[retest_idx],
+            retest_idx - start_idx + 1,
+            round(arch_span / first_rng, 2),
+            first_c["datetime"],
+            early,
+        )
+  return best
+
+
 def _detect_at(
     candles_5m: list[dict],
     candles_30m: list[dict],
@@ -194,13 +276,17 @@ def _detect_at(
     aligned_3h: bool,
     min_pattern_candles: int = 14,
     arch_mult_vs_first: float = 2.5,
+    arch_min_avg_mult: float = 5.0,
     max_pierce_mult: float = 0.35,
+    retest_recent: int = 2,
+    pre_bars: int = 4,
     max_age_hours: float = 36.0,
 ) -> dict | None:
   """
     5M ეტაპი (მხოლოდ 30M + 3H კონტექსტის შემდეგ):
     1) ფანჯარა იზღუდება ბოლო `max_age_hours` (36 საათით).
-    2) საწყისი მიბჯენა -> არკის ფორმირება (>= 2.5x საწყისი სანთლის დიაპაზონთან) -> მეორე მიბჯენა დონეზე.
+    2) საწყისი მიბჯენა -> არკა (>= 2.5x საწყისი სანთელი და >= 5x საშ. დიაპაზონი)
+       -> მეორე მიბჯენა დონეზე (ბოლო 2 სანთელში).
     3) მთლიანი სტრუქტურა: მინიმუმ 14 სანთელი, ღრმა ჩახვრეტის გარეშე.
     """
   recent_5m = _filter_last_hours(candles_5m, hours=max_age_hours)
@@ -215,148 +301,50 @@ def _detect_at(
   last_body = abs(last["close"] - last["open"])
   last_range = max(last["high"] - last["low"], 1e-9)
 
-  matrix_5m = evaluate_volume_matrix(candles_5m, lookback=200, multiplier=1.60)
-  matrix_30m = evaluate_volume_matrix(candles_30m, lookback=150, multiplier=1.50)
-
-  found: dict | None = None
   window = recent_5m[-min(len(recent_5m), 96) :]
-  n = len(window)
+  found: dict | None = None
+  params = dict(
+      min_pattern_candles=min_pattern_candles,
+      arch_mult_vs_first=arch_mult_vs_first,
+      arch_min_avg_mult=arch_min_avg_mult,
+      max_pierce_mult=max_pierce_mult,
+      retest_recent=retest_recent,
+      pre_bars=pre_bars,
+  )
 
-  # 1. Double Bottom (LONG)
-  if last["close"] > last["open"] and last_range >= avg_rng * 0.8:
-    best_bottom = None
-    for start_idx in range(0, n - min_pattern_candles + 1):
-      first_c = window[start_idx]
-      first_rng = max(first_c["high"] - first_c["low"], 1e-9)
-      base_level = first_c["low"]
-      max_pierce = max(first_rng * max_pierce_mult, avg_rng * max_pierce_mult)
-
-      if last["low"] < (base_level - max_pierce):
-        continue
-
-      min_retest_idx = start_idx + min_pattern_candles - 1
-      for retest_idx in range(min_retest_idx, n):
-        arch_slice = window[start_idx + 1 : retest_idx]
-        if not arch_slice:
-          continue
-        arch_peak = max(c["high"] for c in arch_slice)
-        arch_span = arch_peak - base_level
-        if arch_span < first_rng * arch_mult_vs_first:
-          continue
-
-        retest_c = window[retest_idx]
-        if any(
-            c["low"] < (base_level - max_pierce)
-            for c in window[start_idx + 1 : retest_idx + 1]
-        ):
-          continue
-
-        retest_dist = abs(retest_c["low"] - base_level)
-        if retest_dist <= max(first_rng * 0.5, avg_rng * 0.5):
-          total_len = retest_idx - start_idx + 1
-          early_imp_close = _has_early_impulse_and_closeback(
-              arch_slice, avg_rng, "LONG"
-          )
-          score = (arch_span / first_rng) + (0.25 if early_imp_close else 0.0)
-          if best_bottom is None or score > best_bottom[0]:
-            best_bottom = (
-                score,
-                base_level,
-                retest_c["low"],
-                total_len,
-                round(arch_span / first_rng, 2),
-                first_c["datetime"],
-                early_imp_close,
-            )
-
-    if best_bottom is not None:
-      _, base_lvl, retest_lvl, total_len, arch_mult_actual, start_dt, early_imp_close = (
-          best_bottom
-      )
-      found = {
-          "pattern": "DOUBLE_BOTTOM",
-          "direction": "LONG",
-          "bias_30m": bias_30m,
-          "level": round(mean([base_lvl, retest_lvl]), 5),
-          "arch_start_dt": start_dt,
-          "pattern_candles": total_len,
-          "arch_vs_first_mult": arch_mult_actual,
-          "early_impulse_closeback": early_imp_close,
-          "max_age_hours": max_age_hours,
-          "last_candle": last,
-          "impulse_ratio": round(last_body / last_range, 2),
-      }
-
-  # 2. Double Top (SHORT)
-  if not found and last["close"] < last["open"] and last_range >= avg_rng * 0.8:
-    best_top = None
-    for start_idx in range(0, n - min_pattern_candles + 1):
-      first_c = window[start_idx]
-      first_rng = max(first_c["high"] - first_c["low"], 1e-9)
-      base_level = first_c["high"]
-      max_pierce = max(first_rng * max_pierce_mult, avg_rng * max_pierce_mult)
-
-      if last["high"] > (base_level + max_pierce):
-        continue
-
-      min_retest_idx = start_idx + min_pattern_candles - 1
-      for retest_idx in range(min_retest_idx, n):
-        arch_slice = window[start_idx + 1 : retest_idx]
-        if not arch_slice:
-          continue
-        arch_trough = min(c["low"] for c in arch_slice)
-        arch_span = base_level - arch_trough
-        if arch_span < first_rng * arch_mult_vs_first:
-          continue
-
-        retest_c = window[retest_idx]
-        if any(
-            c["high"] > (base_level + max_pierce)
-            for c in window[start_idx + 1 : retest_idx + 1]
-        ):
-          continue
-
-        retest_dist = abs(retest_c["high"] - base_level)
-        if retest_dist <= max(first_rng * 0.5, avg_rng * 0.5):
-          total_len = retest_idx - start_idx + 1
-          early_imp_close = _has_early_impulse_and_closeback(
-              arch_slice, avg_rng, "SHORT"
-          )
-          score = (arch_span / first_rng) + (0.25 if early_imp_close else 0.0)
-          if best_top is None or score > best_top[0]:
-            best_top = (
-                score,
-                base_level,
-                retest_c["high"],
-                total_len,
-                round(arch_span / first_rng, 2),
-                first_c["datetime"],
-                early_imp_close,
-            )
-
-    if best_top is not None:
-      _, base_lvl, retest_lvl, total_len, arch_mult_actual, start_dt, early_imp_close = (
-          best_top
-      )
-      found = {
-          "pattern": "DOUBLE_TOP",
-          "direction": "SHORT",
-          "bias_30m": bias_30m,
-          "level": round(mean([base_lvl, retest_lvl]), 5),
-          "arch_start_dt": start_dt,
-          "pattern_candles": total_len,
-          "arch_vs_first_mult": arch_mult_actual,
-          "early_impulse_closeback": early_imp_close,
-          "max_age_hours": max_age_hours,
-          "last_candle": last,
-          "impulse_ratio": round(last_body / last_range, 2),
-      }
+  for direction, pattern, bullish in (
+      ("LONG", "DOUBLE_BOTTOM", True),
+      ("SHORT", "DOUBLE_TOP", False),
+  ):
+    candle_ok = (
+        (last["close"] > last["open"]) if bullish else (last["close"] < last["open"])
+    ) and last_range >= avg_rng * 0.8
+    if not candle_ok:
+      continue
+    best = _find_double_pattern(window, avg_rng, direction, last, **params)
+    if best is None:
+      continue
+    _, base_lvl, retest_lvl, total_len, arch_mult_actual, start_dt, early = best
+    found = {
+        "pattern": pattern,
+        "direction": direction,
+        "bias_30m": bias_30m,
+        "level": round(mean([base_lvl, retest_lvl]), 5),
+        "arch_start_dt": start_dt,
+        "pattern_candles": total_len,
+        "arch_vs_first_mult": arch_mult_actual,
+        "early_impulse_closeback": early,
+        "max_age_hours": max_age_hours,
+        "last_candle": last,
+        "impulse_ratio": round(last_body / last_range, 2),
+    }
+    break
 
   if not found:
     return None
 
-  found["matrix_5m"] = matrix_5m
-  found["matrix_30m"] = matrix_30m
+  found["matrix_5m"] = evaluate_volume_matrix(candles_5m, lookback=200, multiplier=1.60)
+  found["matrix_30m"] = evaluate_volume_matrix(candles_30m, lookback=150, multiplier=1.50)
   return found
 
 

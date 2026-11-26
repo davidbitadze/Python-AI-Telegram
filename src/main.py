@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import html
 import os
 import time
@@ -7,16 +7,19 @@ from urllib.error import HTTPError
 from ai_evaluator import evaluate_candidate
 from alert_state import (
     build_alert_key,
+    build_cooldown_key,
     build_daily_level_key,
     is_duplicate_alert,
+    is_in_cooldown,
     load_state,
     mark_alert_sent,
     prune_old_daily_keys,
+    prune_old_entries,
     save_state,
 )
 from config import PAIRS, TBILISI_TZ, is_within_entry_window
 from market_calendar import check_market_holidays, is_weekend
-from market_data import fetch_candles
+from market_data import RateLimitError, fetch_candles
 from notifier import send_telegram_message
 from technical_filter import (
     _avg_range,
@@ -28,7 +31,9 @@ from technical_filter import (
 
 REQUEST_DELAY_SEC = 8.0
 ALLOWED_PATTERNS = {"DOUBLE_TOP", "DOUBLE_BOTTOM"}
-MAX_AI_EVALS_PER_RUN = 2
+MAX_AI_EVALS_PER_RUN = int(os.environ.get("MAX_AI_EVALS_PER_RUN", "4"))
+COOLDOWN_MINUTES = 120  # იგივე წყვილი+მიმართულება არაუმეტეს 2 საათში ერთხელ
+HEALTH_ERROR_THRESHOLD = 5  # ამდენ წყვილზე მონაცემის შეცდომისას -> health alert
 
 
 def fetch_with_retry(
@@ -43,6 +48,15 @@ def fetch_with_retry(
       candles = fetch_candles(pair, interval, outputsize=outputsize)
       time.sleep(REQUEST_DELAY_SEC)
       return candles
+    except RateLimitError as exc:
+      if not exc.daily and attempt < max_retries:
+        print(
+            f"[{pair} {interval}] Twelve Data rate limit. Waiting {backoff_sec}s "
+            f"(retry {attempt + 1}/{max_retries})..."
+        )
+        time.sleep(backoff_sec)
+        continue
+      raise
     except HTTPError as exc:
       if exc.code == 429 and attempt < max_retries:
         print(
@@ -52,6 +66,54 @@ def fetch_with_retry(
         time.sleep(backoff_sec)
         continue
       raise
+
+
+def _parse_candle_dt(dt_str: str) -> datetime | None:
+  try:
+    return datetime.strptime(dt_str[:19], "%Y-%m-%d %H:%M:%S")
+  except (ValueError, TypeError):
+    return None
+
+
+def drop_forming_candle(
+    candles: list[dict], now_tbilisi: datetime, minutes: int
+) -> list[dict]:
+  """
+    Twelve Data ბოლოს მიმდინარე (ჯერ დაუხურავ) სანთელსაც აბრუნებს. ასეთი სანთელი
+    სიგნალად არ გამოდგება (მაგ. 19:00 სანთელი 19:00:55-ზე უკვე „იმპულსად“ ჩაითვალა).
+    დრო თბილისის ზონაშია (market_data-ში timezone=Asia/Tbilisi).
+    """
+  if not candles:
+    return candles
+  last_dt = _parse_candle_dt(candles[-1]["datetime"])
+  if last_dt is None:
+    return candles
+  age = now_tbilisi.replace(tzinfo=None) - last_dt
+  if timedelta(0) <= age < timedelta(minutes=minutes):
+    return candles[:-1]
+  return candles
+
+
+def signal_age_minutes(candidate: dict, now_tbilisi: datetime) -> int:
+  """რამდენი წუთია, რაც სიგნალის 5M სანთელი დაიხურა."""
+  dt = _parse_candle_dt(candidate["last_candle"]["datetime"])
+  if dt is None:
+    return candidate.get("candles_ago", 0) * 5
+  closed_at = dt + timedelta(minutes=5)
+  return max(0, int((now_tbilisi.replace(tzinfo=None) - closed_at).total_seconds() // 60))
+
+
+def format_matrix_line(m5: dict, m30: dict) -> str:
+  if m5.get("volume_source") == "RANGE_PROXY":
+    return (
+        f"5M იმპულსი (დიაპაზონის პროქსი, volume არ მოდის): "
+        f"<b>{'YES' if m5['above_threshold'] else 'NO'}</b> "
+        f"(დიაპაზონი x{m5.get('range_ratio')})"
+    )
+  return (
+      f"5M Matrix (200/1.60): <b>{'YES' if m5['above_threshold'] else 'NO'}</b> "
+      f"(x{m5['ratio']}) | 30M (150/1.50): x{m30['ratio']}"
+  )
 
 
 def check_watch_mode(
@@ -132,7 +194,7 @@ def send_ai_down_alert(item: dict, reason: str) -> bool:
       f"<b>{item['pair']}</b> | {cand['pattern']} ({cand['direction']})\n"
       f"30M Bias: <b>{item['bias_30m']}</b> | Level: <b>{cand['level']}</b>\n"
       f"სიგნალის სანთელი: {cand['last_candle']['datetime']} "
-      f"({cand.get('candles_ago', 0) * 5} წთ-ის წინ)\n"
+      f"({signal_age_minutes(cand, datetime.now(TBILISI_TZ))} წთ-ის წინ დაიხურა)\n"
       f"დრო: {now} (თბილისი)\n"
       f"მიზეზი: {html.escape(reason)}"
   )
@@ -174,21 +236,27 @@ def main() -> None:
       return
 
   state, state_changed = prune_old_daily_keys(load_state(), today_str)
+  state, pruned = prune_old_entries(state, now_tbilisi)
+  state_changed = state_changed or pruned
 
   scanned_count = 0
   candidates_count = 0
   notified_count = 0
   ai_evals_used = 0
   quota_exhausted = False
+  fetch_errors = 0
+  last_fetch_error = ""
   queued_for_ai: list[dict] = []
 
   for pair in PAIRS:
     print(f"\n--- [{pair}] ---")
     try:
       candles_30m = fetch_with_retry(pair, "30min", outputsize=160)
+      candles_30m = drop_forming_candle(candles_30m, now_tbilisi, minutes=30)
       bias_30m = infer_30m_bias(candles_30m)
 
       candles_1h = fetch_with_retry(pair, "1h", outputsize=45)
+      candles_1h = drop_forming_candle(candles_1h, now_tbilisi, minutes=60)
       candles_3h = build_3h_from_1h(candles_1h)
       aligned_3h = confirm_3h_alignment(candles_3h, bias_30m)
 
@@ -201,8 +269,11 @@ def main() -> None:
         continue
 
       candles_5m = fetch_with_retry(pair, "5min", outputsize=210)
+      candles_5m = drop_forming_candle(candles_5m, now_tbilisi, minutes=5)
     except Exception as exc:
       print(f"[{pair}] ERROR fetching data: {exc}")
+      fetch_errors += 1
+      last_fetch_error = str(exc)
       continue
 
     scanned_count += 1
@@ -251,6 +322,11 @@ def main() -> None:
         f"5M_vol_above={m5['above_threshold']} (x{m5['ratio']}), candle_dt={last_dt}"
     )
 
+    cooldown_key = build_cooldown_key(pair, candidate["direction"])
+    if is_in_cooldown(state, cooldown_key, now_tbilisi, COOLDOWN_MINUTES):
+      print(f"[{pair}] Result: SKIPPED_COOLDOWN ({COOLDOWN_MINUTES} წთ, key={cooldown_key})")
+      continue
+
     if is_duplicate_alert(state, alert_key, daily_key):
       print(
           f"[{pair}] Result: SKIPPED_DUPLICATE (alert_key={alert_key}, daily_key={daily_key})"
@@ -263,6 +339,7 @@ def main() -> None:
         "candidate": candidate,
         "alert_key": alert_key,
         "daily_key": daily_key,
+        "cooldown_key": cooldown_key,
     })
 
   queued_for_ai.sort(key=candidate_priority, reverse=True)
@@ -277,7 +354,11 @@ def main() -> None:
       print(f"[{item['pair']}] Result: QUOTA_EXHAUSTED -> technical alert")
       if send_ai_down_alert(item, "Gemini-ს კვოტა ამოიწურა"):
         mark_alert_sent(
-            state, item["alert_key"], item["daily_key"], now_tbilisi.isoformat()
+            state,
+            item["alert_key"],
+            item["daily_key"],
+            now_tbilisi.isoformat(),
+            item["cooldown_key"],
         )
         state_changed = True
         notified_count += 1
@@ -307,7 +388,9 @@ def main() -> None:
         quota_exhausted = True
       short = "კვოტა ამოიწურა" if quota_exhausted else "დროებითი შეცდომა"
       if send_ai_down_alert(item, f"Gemini: {short}"):
-        mark_alert_sent(state, alert_key, daily_key, now_tbilisi.isoformat())
+        mark_alert_sent(
+            state, alert_key, daily_key, now_tbilisi.isoformat(), item["cooldown_key"]
+        )
         state_changed = True
         notified_count += 1
         print(f"[{pair}] Result: SENT_TELEGRAM (AI down)")
@@ -324,9 +407,9 @@ def main() -> None:
       msg = (
           f"<b>{pair}</b> | {candidate['pattern']} ({candidate['direction']})\n"
           f"30M Bias: <b>{bias_30m}</b> | Level: <b>{candidate['level']}</b>\n"
-          f"5M Matrix (200/1.60): <b>{'YES' if m5['above_threshold'] else 'NO'}</b> "
-          f"(x{m5['ratio']}) | 30M (150/1.50): x{m30['ratio']}\n"
-          f"სიგნალის სანთელი: {last_dt} ({candidate.get('candles_ago', 0) * 5} წთ-ის წინ)\n"
+          f"{format_matrix_line(m5, m30)}\n"
+          f"სიგნალის სანთელი: {last_dt} "
+          f"({signal_age_minutes(candidate, datetime.now(TBILISI_TZ))} წთ-ის წინ დაიხურა)\n"
           f"TV Circle / 1M Delta: <i>გადასამოწმებელია TradingView-ზე</i>\n"
           f"Score: <b>{score}/10</b>\n"
           f"დრო: {datetime.now(TBILISI_TZ).strftime('%H:%M')} (თბილისი)\n"
@@ -339,12 +422,27 @@ def main() -> None:
         print(f"[{pair}] ERROR sending Telegram: {exc}")
         continue
 
-      mark_alert_sent(state, alert_key, daily_key, now_tbilisi.isoformat())
+      mark_alert_sent(
+          state, alert_key, daily_key, now_tbilisi.isoformat(), item["cooldown_key"]
+      )
       state_changed = True
       notified_count += 1
       print(f"[{pair}] Result: SENT_TELEGRAM")
     else:
       print(f"[{pair}] Result: NOT_NOTIFIED_BY_AI")
+
+  if fetch_errors >= HEALTH_ERROR_THRESHOLD:
+    health_key = f"DAILY_{today_str}_HEALTH_{now_tbilisi.strftime('%H')}"
+    if not state.get(health_key):
+      try:
+        send_telegram_message(
+            f"🛠 სკანერის პრობლემა: {fetch_errors}/{len(PAIRS)} წყვილზე მონაცემები "
+            f"ვერ წამოვიდა.\nბოლო შეცდომა: {html.escape(last_fetch_error[:300], quote=False)}"
+        )
+        state[health_key] = now_tbilisi.isoformat()
+        state_changed = True
+      except Exception as exc:
+        print(f"ERROR sending health alert: {exc}")
 
   if state_changed:
     save_state(state)
