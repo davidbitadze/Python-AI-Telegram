@@ -63,14 +63,18 @@ def evaluate_volume_matrix(
     A.Volume SMA - Davit's Matrix v3.8 (REST API ადაპტაცია 1M lower-TF მოთხოვნების გარეშე):
     - 5M: lookback=200, multiplier=1.60
     - 30M: lookback=150, multiplier=1.50
+    თუ volume მონაცემი არ მოდის (sma_vol == 0), იყენებს სანთლის დიაპაზონის/იმპულსის პროქსის.
     """
   if not candles:
     return {
         "above_threshold": False,
         "ratio": 0.0,
+        "range_ratio": 0.0,
+        "volume_source": "NO_DATA",
         "sma_vol": 0.0,
         "last_vol": 0.0,
         "candle_dir": "FLAT",
+        "body_strength": 0.0,
         "proxy_delta_hint": "NO_DATA",
     }
 
@@ -83,11 +87,6 @@ def evaluate_volume_matrix(
       if (c.get("volume") or 0.0) > 0
   ]
 
-  sma_vol = mean(vols) if vols else 0.0
-  threshold_vol = sma_vol * multiplier
-  above_threshold = (sma_vol > 0) and (last_vol >= threshold_vol)
-  ratio = round(last_vol / sma_vol, 2) if sma_vol > 0 else 0.0
-
   if last["close"] > last["open"]:
     candle_dir = "BULLISH"
   elif last["close"] < last["open"]:
@@ -98,19 +97,42 @@ def evaluate_volume_matrix(
   rng = max(last["high"] - last["low"], 1e-9)
   body = last["close"] - last["open"]
   body_strength = round(abs(body) / rng, 2)
+  avg_rng = _avg_range(candles[:-1] if len(candles) > 1 else candles, lookback=20)
+  range_ratio = round(rng / avg_rng, 2) if avg_rng > 0 else 0.0
 
-  if not above_threshold:
-    proxy_hint = "BELOW_THRESHOLD"
-  elif candle_dir == "BULLISH" and body_strength >= 0.45:
-    proxy_hint = "STRONG_BULL_IMPULSE_VERIFY_TV_CIRCLE"
-  elif candle_dir == "BEARISH" and body_strength >= 0.45:
-    proxy_hint = "STRONG_BEAR_IMPULSE_VERIFY_TV_CIRCLE"
+  sma_vol = mean(vols) if vols else 0.0
+  if sma_vol > 0:
+    threshold_vol = sma_vol * multiplier
+    above_threshold = last_vol >= threshold_vol
+    ratio = round(last_vol / sma_vol, 2)
+    volume_source = "VOL_SMA"
+    if not above_threshold:
+      proxy_hint = "BELOW_THRESHOLD"
+    elif candle_dir == "BULLISH" and body_strength >= 0.45:
+      proxy_hint = "STRONG_BULL_IMPULSE_VERIFY_TV_CIRCLE"
+    elif candle_dir == "BEARISH" and body_strength >= 0.45:
+      proxy_hint = "STRONG_BEAR_IMPULSE_VERIFY_TV_CIRCLE"
+    else:
+      proxy_hint = "MIXED_WICK_OR_WEAK_BODY_VERIFY_TV_CIRCLE"
   else:
-    proxy_hint = "MIXED_WICK_OR_WEAK_BODY_VERIFY_TV_CIRCLE"
+    # Fallback როცა Twelve Data volume-ს არ აბრუნებს: ფასის დიაპაზონის + სხეულის იმპულსი
+    above_threshold = range_ratio >= 1.35 and body_strength >= 0.50
+    ratio = 0.0
+    volume_source = "RANGE_PROXY"
+    if candle_dir == "BULLISH" and above_threshold:
+      proxy_hint = "PROXY_STRONG_BULL_RANGE_VERIFY_TV_CIRCLE"
+    elif candle_dir == "BEARISH" and above_threshold:
+      proxy_hint = "PROXY_STRONG_BEAR_RANGE_VERIFY_TV_CIRCLE"
+    elif range_ratio >= 1.15:
+      proxy_hint = "PROXY_MODERATE_RANGE_VERIFY_TV_CIRCLE"
+    else:
+      proxy_hint = "PROXY_LOW_RANGE_VERIFY_TV_CIRCLE"
 
   return {
       "above_threshold": above_threshold,
       "ratio": ratio,
+      "range_ratio": range_ratio,
+      "volume_source": volume_source,
       "multiplier": multiplier,
       "lookback": lookback,
       "sma_vol": round(sma_vol, 2),
