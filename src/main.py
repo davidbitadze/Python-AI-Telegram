@@ -1,13 +1,21 @@
 from datetime import datetime
 import html
-import json
 import os
-from pathlib import Path
 import time
 from urllib.error import HTTPError
 
 from ai_evaluator import evaluate_candidate
+from alert_state import (
+    build_alert_key,
+    build_daily_level_key,
+    is_duplicate_alert,
+    load_state,
+    mark_alert_sent,
+    prune_old_daily_keys,
+    save_state,
+)
 from config import PAIRS, TBILISI_TZ, is_within_entry_window
+from market_calendar import check_market_holidays, is_weekend
 from market_data import fetch_candles
 from notifier import send_telegram_message
 from technical_filter import (
@@ -18,7 +26,6 @@ from technical_filter import (
     infer_30m_bias,
 )
 
-STATE_FILE = Path("state/sent_alerts.json")
 REQUEST_DELAY_SEC = 8.0
 ALLOWED_PATTERNS = {"DOUBLE_TOP", "DOUBLE_BOTTOM"}
 MAX_AI_EVALS_PER_RUN = 2
@@ -47,45 +54,10 @@ def fetch_with_retry(
       raise
 
 
-def load_state() -> dict:
-  if not STATE_FILE.exists():
-    return {}
-  return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-
-
-def save_state(state: dict) -> None:
-  STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-  STATE_FILE.write_text(
-      json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-  )
-
-
-def prune_old_daily_keys(state: dict, today_str: str) -> tuple[dict, bool]:
-  """ასუფთავებს წინა დღეების `DAILY_...` ჩანაწერებს `sent_alerts.json`-ში."""
-  today_prefix = f"DAILY_{today_str}_"
-  cleaned = {
-      k: v
-      for k, v in state.items()
-      if not k.startswith("DAILY_") or k.startswith(today_prefix)
-  }
-  return cleaned, (len(cleaned) != len(state))
-
-
-def build_daily_level_key(
-    today_str: str, pair: str, pattern: str, direction: str, level: float
-) -> str:
-  """დღიური დონის გასაღები: გამორიცხავს ერთსა და იმავე დონეზე დღიურ დუბლირებას."""
-  lvl_rounded = round(float(level), 4)
-  return f"DAILY_{today_str}_{pair}_{pattern}_{direction}_{lvl_rounded}"
-
-
 def check_watch_mode(
     candles_5m: list[dict], candles_30m: list[dict], bias_30m: str
 ) -> str | None:
-  """
-    მოლოდინის რეჟიმი (AI-ს და ტელეგრამ-სპამის გარეშე):
-    როცა ფასი ახლოსაა ბოლო 24 სანთლის ექსტრემუმთან და მოცულობა საყურადღებოა.
-    """
+  """მოლოდინის რეჟიმი (AI-ს და ტელეგრამ-სპამის გარეშე)."""
   if len(candles_5m) < 25:
     return None
   avg_rng = _avg_range(candles_5m, lookback=20)
@@ -180,16 +152,26 @@ def main() -> None:
   now_tbilisi = datetime.now(TBILISI_TZ)
   today_str = now_tbilisi.strftime("%Y-%m-%d")
   force_run = os.environ.get("FORCE_RUN", "false").lower() == "true"
+  weekend = is_weekend(now_tbilisi)
   in_window = is_within_entry_window(now_tbilisi)
+  uk_closed, us_closed, holiday_status = check_market_holidays(now_tbilisi.date())
 
   print(
       f"=== SCAN START | Tbilisi: {now_tbilisi.strftime('%Y-%m-%d %H:%M:%S %Z')} "
-      f"(weekday={now_tbilisi.weekday()}) | in_window={in_window} | force_run={force_run} ==="
+      f"(weekday={now_tbilisi.weekday()}, weekend={weekend}) | in_window={in_window} "
+      f"| market_status={holiday_status} | force_run={force_run} ==="
   )
 
-  if not force_run and not in_window:
-    print("Outside entry window (13:00-21:30 Tbilisi or weekend). Skipping.")
-    return
+  if not force_run:
+    if weekend or not in_window:
+      print("Weekend or outside entry window (13:00-21:30 Tbilisi). Skipping.")
+      return
+    if uk_closed and us_closed:
+      print(
+          f"Both London (LSE) and New York (NYSE) markets are closed ({holiday_status}). "
+          "Skipping scan and AI calls."
+      )
+      return
 
   state, state_changed = prune_old_daily_keys(load_state(), today_str)
 
@@ -252,7 +234,9 @@ def main() -> None:
     candidates_count += 1
     m5 = candidate["matrix_5m"]
     last_dt = candidate["last_candle"]["datetime"]
-    alert_key = f"{pair}_{pattern_name}_{candidate['direction']}_{last_dt}"
+    alert_key = build_alert_key(
+        pair, pattern_name, candidate["direction"], last_dt
+    )
     daily_key = build_daily_level_key(
         today_str,
         pair,
@@ -267,7 +251,7 @@ def main() -> None:
         f"5M_vol_above={m5['above_threshold']} (x{m5['ratio']}), candle_dt={last_dt}"
     )
 
-    if state.get(alert_key) or state.get(daily_key):
+    if is_duplicate_alert(state, alert_key, daily_key):
       print(
           f"[{pair}] Result: SKIPPED_DUPLICATE (alert_key={alert_key}, daily_key={daily_key})"
       )
@@ -292,9 +276,9 @@ def main() -> None:
     if quota_exhausted:
       print(f"[{item['pair']}] Result: QUOTA_EXHAUSTED -> technical alert")
       if send_ai_down_alert(item, "Gemini-ს კვოტა ამოიწურა"):
-        ts = now_tbilisi.isoformat()
-        state[item["alert_key"]] = ts
-        state[item["daily_key"]] = ts
+        mark_alert_sent(
+            state, item["alert_key"], item["daily_key"], now_tbilisi.isoformat()
+        )
         state_changed = True
         notified_count += 1
         print(f"[{item['pair']}] Result: SENT_TELEGRAM (AI down)")
@@ -323,9 +307,7 @@ def main() -> None:
         quota_exhausted = True
       short = "კვოტა ამოიწურა" if quota_exhausted else "დროებითი შეცდომა"
       if send_ai_down_alert(item, f"Gemini: {short}"):
-        ts = now_tbilisi.isoformat()
-        state[alert_key] = ts
-        state[daily_key] = ts
+        mark_alert_sent(state, alert_key, daily_key, now_tbilisi.isoformat())
         state_changed = True
         notified_count += 1
         print(f"[{pair}] Result: SENT_TELEGRAM (AI down)")
@@ -357,9 +339,7 @@ def main() -> None:
         print(f"[{pair}] ERROR sending Telegram: {exc}")
         continue
 
-      ts = now_tbilisi.isoformat()
-      state[alert_key] = ts
-      state[daily_key] = ts
+      mark_alert_sent(state, alert_key, daily_key, now_tbilisi.isoformat())
       state_changed = True
       notified_count += 1
       print(f"[{pair}] Result: SENT_TELEGRAM")
