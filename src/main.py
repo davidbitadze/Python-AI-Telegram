@@ -10,12 +10,18 @@ from ai_evaluator import evaluate_candidate
 from config import PAIRS, TBILISI_TZ, is_within_entry_window
 from market_data import fetch_candles
 from notifier import send_telegram_message
-from technical_filter import confirm_3h_alignment, detect_5m_candidate, infer_30m_bias
+from technical_filter import (
+    _avg_range,
+    confirm_3h_alignment,
+    detect_5m_candidate,
+    evaluate_volume_matrix,
+    infer_30m_bias,
+)
 
 STATE_FILE = Path("state/sent_alerts.json")
-REQUEST_DELAY_SEC = 8.0  # Twelve Data free: 8 მოთხოვნა/წუთში
+REQUEST_DELAY_SEC = 8.0
 ALLOWED_PATTERNS = {"DOUBLE_TOP", "DOUBLE_BOTTOM"}
-MAX_AI_EVALS_PER_RUN = 2  # დღიური ლიმიტის დასაზოგად
+MAX_AI_EVALS_PER_RUN = 2
 
 
 def fetch_with_retry(
@@ -54,8 +60,66 @@ def save_state(state: dict) -> None:
   )
 
 
+def prune_old_daily_keys(state: dict, today_str: str) -> tuple[dict, bool]:
+  """ასუფთავებს წინა დღეების `DAILY_...` ჩანაწერებს `sent_alerts.json`-ში."""
+  today_prefix = f"DAILY_{today_str}_"
+  cleaned = {
+      k: v
+      for k, v in state.items()
+      if not k.startswith("DAILY_") or k.startswith(today_prefix)
+  }
+  return cleaned, (len(cleaned) != len(state))
+
+
+def build_daily_level_key(
+    today_str: str, pair: str, pattern: str, direction: str, level: float
+) -> str:
+  """დღიური დონის გასაღები: გამორიცხავს ერთსა და იმავე დონეზე დღიურ დუბლირებას."""
+  lvl_rounded = round(float(level), 4)
+  return f"DAILY_{today_str}_{pair}_{pattern}_{direction}_{lvl_rounded}"
+
+
+def check_watch_mode(
+    candles_5m: list[dict], candles_30m: list[dict], bias_30m: str
+) -> str | None:
+  """
+    მოლოდინის რეჟიმი (AI-ს და ტელეგრამ-სპამის გარეშე):
+    როცა ფასი ახლოსაა ბოლო 24 სანთლის ექსტრემუმთან და მოცულობა საყურადღებოა.
+    """
+  if len(candles_5m) < 25:
+    return None
+  avg_rng = _avg_range(candles_5m, lookback=20)
+  if avg_rng <= 0:
+    return None
+  m5 = evaluate_volume_matrix(candles_5m, lookback=200, multiplier=1.60)
+  m30 = evaluate_volume_matrix(candles_30m, lookback=150, multiplier=1.50)
+  vol_notable = bool(
+      m5.get("above_threshold")
+      or m30.get("above_threshold")
+      or float(m5.get("ratio") or 0.0) >= 1.5
+  )
+  if not vol_notable:
+    return None
+
+  last = candles_5m[-1]
+  recent_high = max(c["high"] for c in candles_5m[-25:-1])
+  recent_low = min(c["low"] for c in candles_5m[-25:-1])
+  prox_threshold = avg_rng * 0.6
+
+  if abs(last["high"] - recent_high) <= prox_threshold:
+    return (
+        f"WATCH_DOUBLE_TOP_PROX (bias={bias_30m}, level={round(recent_high, 5)}, "
+        f"5M_vol=x{m5.get('ratio')}, 30M_vol=x{m30.get('ratio')})"
+    )
+  if abs(last["low"] - recent_low) <= prox_threshold:
+    return (
+        f"WATCH_DOUBLE_BOTTOM_PROX (bias={bias_30m}, level={round(recent_low, 5)}, "
+        f"5M_vol=x{m5.get('ratio')}, 30M_vol=x{m30.get('ratio')})"
+    )
+  return None
+
+
 def build_3h_from_1h(candles_1h: list[dict]) -> list[dict]:
-  """1H სანთლებისგან აწყობს 3H ბლოკებს."""
   blocks = []
   for i in range(0, len(candles_1h) - 2, 3):
     chunk = candles_1h[i : i + 3]
@@ -80,7 +144,6 @@ def run_telegram_test() -> None:
 
 
 def candidate_priority(item: dict) -> tuple:
-  """პრიორიტეტს ანიჭებს 5M მოცულობის მქონე და უფრო ძლიერ კანდიდატებს."""
   cand = item["candidate"]
   m5 = cand.get("matrix_5m", {})
   vol_ok = 1 if m5.get("above_threshold") else 0
@@ -90,7 +153,6 @@ def candidate_priority(item: dict) -> tuple:
 
 
 def send_ai_down_alert(item: dict, reason: str) -> bool:
-  """AI მიუწვდომელია -> მოკლე ტექნიკური შეტყობინება, რომ სიგნალი არ დაიკარგოს."""
   cand = item["candidate"]
   now = datetime.now(TBILISI_TZ).strftime("%H:%M")
   msg = (
@@ -116,6 +178,7 @@ def main() -> None:
     return
 
   now_tbilisi = datetime.now(TBILISI_TZ)
+  today_str = now_tbilisi.strftime("%Y-%m-%d")
   force_run = os.environ.get("FORCE_RUN", "false").lower() == "true"
   in_window = is_within_entry_window(now_tbilisi)
 
@@ -128,8 +191,7 @@ def main() -> None:
     print("Outside entry window (13:00-21:30 Tbilisi or weekend). Skipping.")
     return
 
-  state = load_state()
-  state_changed = False
+  state, state_changed = prune_old_daily_keys(load_state(), today_str)
 
   scanned_count = 0
   candidates_count = 0
@@ -175,7 +237,11 @@ def main() -> None:
     )
 
     if not candidate:
-      print(f"[{pair}] Result: NO_CANDIDATE")
+      watch_note = check_watch_mode(candles_5m, candles_30m, bias_30m)
+      if watch_note:
+        print(f"[{pair}] Result: NO_CANDIDATE | {watch_note}")
+      else:
+        print(f"[{pair}] Result: NO_CANDIDATE")
       continue
 
     pattern_name = candidate.get("pattern", "")
@@ -187,6 +253,13 @@ def main() -> None:
     m5 = candidate["matrix_5m"]
     last_dt = candidate["last_candle"]["datetime"]
     alert_key = f"{pair}_{pattern_name}_{candidate['direction']}_{last_dt}"
+    daily_key = build_daily_level_key(
+        today_str,
+        pair,
+        pattern_name,
+        candidate["direction"],
+        candidate["level"],
+    )
 
     print(
         f"[{pair}] CANDIDATE found: pattern={pattern_name}, dir={candidate['direction']}, "
@@ -194,8 +267,10 @@ def main() -> None:
         f"5M_vol_above={m5['above_threshold']} (x{m5['ratio']}), candle_dt={last_dt}"
     )
 
-    if state.get(alert_key):
-      print(f"[{pair}] Result: SKIPPED_DUPLICATE (key={alert_key})")
+    if state.get(alert_key) or state.get(daily_key):
+      print(
+          f"[{pair}] Result: SKIPPED_DUPLICATE (alert_key={alert_key}, daily_key={daily_key})"
+      )
       continue
 
     queued_for_ai.append({
@@ -203,6 +278,7 @@ def main() -> None:
         "bias_30m": bias_30m,
         "candidate": candidate,
         "alert_key": alert_key,
+        "daily_key": daily_key,
     })
 
   queued_for_ai.sort(key=candidate_priority, reverse=True)
@@ -216,7 +292,9 @@ def main() -> None:
     if quota_exhausted:
       print(f"[{item['pair']}] Result: QUOTA_EXHAUSTED -> technical alert")
       if send_ai_down_alert(item, "Gemini-ს კვოტა ამოიწურა"):
-        state[item["alert_key"]] = now_tbilisi.isoformat()
+        ts = now_tbilisi.isoformat()
+        state[item["alert_key"]] = ts
+        state[item["daily_key"]] = ts
         state_changed = True
         notified_count += 1
         print(f"[{item['pair']}] Result: SENT_TELEGRAM (AI down)")
@@ -226,6 +304,7 @@ def main() -> None:
     bias_30m = item["bias_30m"]
     candidate = item["candidate"]
     alert_key = item["alert_key"]
+    daily_key = item["daily_key"]
     m5 = candidate["matrix_5m"]
     m30 = candidate["matrix_30m"]
     last_dt = candidate["last_candle"]["datetime"]
@@ -244,7 +323,9 @@ def main() -> None:
         quota_exhausted = True
       short = "კვოტა ამოიწურა" if quota_exhausted else "დროებითი შეცდომა"
       if send_ai_down_alert(item, f"Gemini: {short}"):
-        state[alert_key] = now_tbilisi.isoformat()
+        ts = now_tbilisi.isoformat()
+        state[alert_key] = ts
+        state[daily_key] = ts
         state_changed = True
         notified_count += 1
         print(f"[{pair}] Result: SENT_TELEGRAM (AI down)")
@@ -276,7 +357,9 @@ def main() -> None:
         print(f"[{pair}] ERROR sending Telegram: {exc}")
         continue
 
-      state[alert_key] = now_tbilisi.isoformat()
+      ts = now_tbilisi.isoformat()
+      state[alert_key] = ts
+      state[daily_key] = ts
       state_changed = True
       notified_count += 1
       print(f"[{pair}] Result: SENT_TELEGRAM")
