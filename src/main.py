@@ -22,6 +22,7 @@ from market_calendar import check_market_holidays, is_weekend
 from market_data import RateLimitError, fetch_candles
 from notifier import send_telegram_message
 from technical_filter import (
+    ARCH_MIN_AVG_MULT,
     _avg_range,
     confirm_3h_alignment,
     detect_5m_candidate,
@@ -31,7 +32,7 @@ from technical_filter import (
 
 REQUEST_DELAY_SEC = 8.0
 ALLOWED_PATTERNS = {"DOUBLE_TOP", "DOUBLE_BOTTOM"}
-MAX_AI_EVALS_PER_RUN = int(os.environ.get("MAX_AI_EVALS_PER_RUN", "4"))
+MAX_AI_EVALS_PER_RUN = int(os.environ.get("MAX_AI_EVALS_PER_RUN") or 4)
 COOLDOWN_MINUTES = 120  # იგივე წყვილი+მიმართულება არაუმეტეს 2 საათში ერთხელ
 HEALTH_ERROR_THRESHOLD = 5  # ამდენ წყვილზე მონაცემის შეცდომისას -> health alert
 
@@ -226,7 +227,7 @@ def main() -> None:
 
   if not force_run:
     if weekend or not in_window:
-      print("Weekend or outside entry window (13:00-21:30 Tbilisi). Skipping.")
+      print("Weekend or outside entry window (12:30-21:30 Tbilisi). Skipping.")
       return
     if uk_closed and us_closed:
       print(
@@ -290,6 +291,21 @@ def main() -> None:
     )
 
     if not candidate:
+      # „თითქმის“ სიგნალი: განმუხტული წესით (3x) იპოვებოდა? (მხოლოდ ლოგში, დასაკალიბრებლად)
+      if ARCH_MIN_AVG_MULT > 3.0:
+        near = detect_5m_candidate(
+            candles_5m=candles_5m,
+            candles_30m=candles_30m,
+            bias_30m=bias_30m,
+            aligned_3h=aligned_3h,
+            arch_min_avg_mult=3.0,
+        )
+        if near:
+          print(
+              f"[{pair}] NEAR_MISS: {near['pattern']} level={near['level']} "
+              f"arch={near.get('arch_vs_avg_mult')}x avg (needs >= {ARCH_MIN_AVG_MULT}x), "
+              f"candle_dt={near['last_candle']['datetime']}"
+          )
       watch_note = check_watch_mode(candles_5m, candles_30m, bias_30m)
       if watch_note:
         print(f"[{pair}] Result: NO_CANDIDATE | {watch_note}")
@@ -319,6 +335,7 @@ def main() -> None:
     print(
         f"[{pair}] CANDIDATE found: pattern={pattern_name}, dir={candidate['direction']}, "
         f"level={candidate['level']}, impulse={candidate.get('impulse_ratio')}, "
+        f"arch={candidate.get('arch_vs_avg_mult')}x avg, candles={candidate.get('pattern_candles')}, "
         f"5M_vol_above={m5['above_threshold']} (x{m5['ratio']}), candle_dt={last_dt}"
     )
 

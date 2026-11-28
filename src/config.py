@@ -16,7 +16,7 @@ PAIRS = [
     "GBPUSD",
 ]
 
-ENTRY_WINDOW_START = time(13, 0)
+ENTRY_WINDOW_START = time(12, 30)
 ENTRY_WINDOW_END = time(21, 30)
 
 # პრიორიტეტული პატერნები: 1) Double Top / Double Bottom, 2) V-Reversal

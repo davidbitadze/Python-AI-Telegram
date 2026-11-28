@@ -1,5 +1,10 @@
+import os
 from datetime import datetime, timedelta
 from statistics import mean
+
+# არკის მინიმალური სიღრმე საშუალო 5M დიაპაზონის ჯერადებში (ხმაურის ფილტრი).
+# შეიძლება შეიცვალოს GitHub-ში ცვლადით ARCH_MIN_AVG_MULT, კოდის შეცვლის გარეშე.
+ARCH_MIN_AVG_MULT = float(os.environ.get("ARCH_MIN_AVG_MULT") or 4.0)
 
 
 def _parse_dt(dt_str: str | None) -> datetime | None:
@@ -265,6 +270,7 @@ def _find_double_pattern(
             round(arch_span / first_rng, 2),
             first_c["datetime"],
             early,
+            round(arch_span / avg_rng, 2),
         )
   return best
 
@@ -276,7 +282,7 @@ def _detect_at(
     aligned_3h: bool,
     min_pattern_candles: int = 14,
     arch_mult_vs_first: float = 2.5,
-    arch_min_avg_mult: float = 5.0,
+    arch_min_avg_mult: float = ARCH_MIN_AVG_MULT,
     max_pierce_mult: float = 0.35,
     retest_recent: int = 2,
     pre_bars: int = 4,
@@ -285,7 +291,7 @@ def _detect_at(
   """
     5M ეტაპი (მხოლოდ 30M + 3H კონტექსტის შემდეგ):
     1) ფანჯარა იზღუდება ბოლო `max_age_hours` (36 საათით).
-    2) საწყისი მიბჯენა -> არკა (>= 2.5x საწყისი სანთელი და >= 5x საშ. დიაპაზონი)
+    2) საწყისი მიბჯენა -> არკა (>= 2.5x საწყისი სანთელი და >= ARCH_MIN_AVG_MULT x საშ. დიაპაზონი, ნაგულისხმევი 4)
        -> მეორე მიბჯენა დონეზე (ბოლო 2 სანთელში).
     3) მთლიანი სტრუქტურა: მინიმუმ 14 სანთელი, ღრმა ჩახვრეტის გარეშე.
     """
@@ -324,7 +330,7 @@ def _detect_at(
     best = _find_double_pattern(window, avg_rng, direction, last, **params)
     if best is None:
       continue
-    _, base_lvl, retest_lvl, total_len, arch_mult_actual, start_dt, early = best
+    _, base_lvl, retest_lvl, total_len, arch_mult_actual, start_dt, early, arch_vs_avg = best
     found = {
         "pattern": pattern,
         "direction": direction,
@@ -333,6 +339,7 @@ def _detect_at(
         "arch_start_dt": start_dt,
         "pattern_candles": total_len,
         "arch_vs_first_mult": arch_mult_actual,
+        "arch_vs_avg_mult": arch_vs_avg,
         "early_impulse_closeback": early,
         "max_age_hours": max_age_hours,
         "last_candle": last,
@@ -354,6 +361,7 @@ def detect_5m_candidate(
     bias_30m: str,
     aligned_3h: bool,
     lookback_candles: int = 6,
+    arch_min_avg_mult: float | None = None,
 ) -> dict | None:
   """
     ამოწმებს ბოლო `lookback_candles` ხუთწუთიან სანთელს (6 = 30 წუთი), რადგან
@@ -362,7 +370,8 @@ def detect_5m_candidate(
     """
   for k in range(lookback_candles):
     subset = candles_5m[: len(candles_5m) - k]
-    found = _detect_at(subset, candles_30m, bias_30m, aligned_3h)
+    extra = {} if arch_min_avg_mult is None else {"arch_min_avg_mult": arch_min_avg_mult}
+    found = _detect_at(subset, candles_30m, bias_30m, aligned_3h, **extra)
     if found:
       found["candles_ago"] = k
       return found
