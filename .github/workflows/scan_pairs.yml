@@ -1,9 +1,9 @@
 name: Forex 10-Pair AI Scanner
 
+# გაშვებას აკეთებს cron-job.org (workflow_dispatch). GitHub-ის საკუთარი schedule
+# გამორთულია, რომ სკანირება ორჯერ არ გაეშვას და Twelve Data-ს ლიმიტი არ დაიხარჯოს.
 on:
-  schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch: # ხელით გაშვების ღილაკი ტესტირებისთვის
+  workflow_dispatch:
     inputs:
       test_telegram:
         description: "მხოლოდ სატესტო შეტყობინების გაგზავნა Telegram-ში"
@@ -17,9 +17,15 @@ on:
 permissions:
   contents: write # state/sent_alerts.json-ის push-ისთვის
 
+# ერთდროულად მხოლოდ ერთი გაშვება: მეორე რიგში დგება და ახალ state-ს ნახავს
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,11 +34,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Run scanner
         env:
@@ -42,6 +47,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_TELEGRAM: ${{ inputs.test_telegram }}
           FORCE_RUN: ${{ inputs.force_run }}
+          # არასავალდებულო: GitHub -> Settings -> Variables -> Actions
+          ARCH_MIN_AVG_MULT: ${{ vars.ARCH_MIN_AVG_MULT }}
+          MAX_AI_EVALS_PER_RUN: ${{ vars.MAX_AI_EVALS_PER_RUN }}
         run: python src/main.py
 
       - name: Save alert state
@@ -49,4 +57,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state/sent_alerts.json || true
-          git diff --staged --quiet || (git commit -m "Update alert state" && git push)
+          if git diff --staged --quiet; then
+            echo "No state changes."
+            exit 0
+          fi
+          git commit -m "Update alert state"
+          for i in 1 2 3; do
+            if git pull --rebase origin main && git push; then
+              exit 0
+            fi
+            echo "Push attempt $i failed, retrying..."
+            sleep 5
+          done
+          exit 1
